@@ -1,4 +1,6 @@
 import dns from 'node:dns'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 dns.setServers(['1.1.1.1', '8.8.8.8'])
 
@@ -7,7 +9,7 @@ import express from 'express'
 import multer from 'multer'
 import dotenv from 'dotenv'
 import { MongoClient } from 'mongodb'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, createHash } from 'node:crypto'
 import { Contract, JsonRpcProvider, getAddress, isAddress, verifyMessage } from 'ethers'
 
 dotenv.config()
@@ -25,7 +27,10 @@ const RPC_URL = process.env.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.pub
 const chain = new JsonRpcProvider(RPC_URL, Number(CHAIN_ID), { staticNetwork: true })
 const rolesContract = new Contract(CONTRACT_ADDRESS, [
   'function DEFAULT_ADMIN_ROLE() view returns (bytes32)',
-  'function hasRole(bytes32 role, address account) view returns (bool)'
+  'function CERTIFIER_ROLE() view returns (bytes32)',
+  'function hasRole(bytes32 role, address account) view returns (bool)',
+  'function batches(uint256) view returns (string productName,string farmName,uint256 harvestDate,address farmer,address currentHolder,bool exists,uint8 stage)',
+  'function nextBatchId() view returns (uint256)'
 ], chain)
 
 // One-use, short-lived wallet challenges; never accept an unsigned claimed admin address.
@@ -346,6 +351,220 @@ app.post('/upload', (req, res, next) => {
       error: 'PDF upload failed.'
     })
   }
+})
+
+// Extra batch information is off-chain; records are identified by chain + contract + batch ID.
+// A fresh wallet signature must authorize every write. CORS alone is NOT authorization.
+const metadataChallenges = new Map()
+const metadataImageUpload = multer({
+  storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, cb) {
+    cb(null, ['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype))
+  }
+})
+const metadataKey = (id) => ({ chainId: Number(CHAIN_ID), contractAddress: CONTRACT_ADDRESS.toLowerCase(), batchId: String(id) })
+const isHexHash = (s) => typeof s === 'string' && /^[0-9a-f]{64}$/.test(s)
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
+const imageMimeFromMagic = (bytes) => {
+  if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.length > 8 && bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return 'image/png'
+  if (bytes.length > 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  return null
+}
+async function verifiedBatch(batchId) {
+  if (!/^[1-9]\d*$/.test(String(batchId))) throw new Error('Invalid batch ID.')
+  const id = BigInt(batchId)
+  if (id >= await rolesContract.nextBatchId()) throw new Error('Batch does not exist on Sepolia.')
+  const batch = await rolesContract.batches(id)
+  if (!batch.exists) throw new Error('Batch does not exist on Sepolia.')
+  return batch
+}
+function validateMetadata(kind, raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid metadata.')
+  const field = (key, max = 150) => {
+    if (typeof raw[key] !== 'string') throw new Error(`${key} is required.`)
+    const value = raw[key].trim().replace(/\s+/g, ' ')
+    if (!value || value.length > max) throw new Error(`${key} must be 1–${max} characters.`)
+    return value
+  }
+  if (kind === 'farm') {
+    const location = field('farmLocation', 200)
+    const description = typeof raw.description === 'string' ? raw.description.trim() : ''
+    if (description.length > 500) throw new Error('Description must be at most 500 characters.')
+    const imageHash = raw.imageHash === '' ? '' : raw.imageHash
+    if (imageHash !== '' && !isHexHash(imageHash)) throw new Error('Invalid image SHA-256.')
+    const suppliedQuantity = raw.quantityKg !== null && raw.quantityKg !== undefined && raw.quantityKg !== ''
+    const quantityKg = suppliedQuantity ? Number(raw.quantityKg) : null
+    if (suppliedQuantity && (!Number.isFinite(quantityKg) || quantityKg <= 0 || quantityKg > 1e12)) throw new Error('Batch quantity must be positive (kg).')
+    return { farmLocation: location, description, imageHash, quantityKg }
+  }
+  if (kind === 'shipment') {
+    const shipmentId = field('shipmentId', 80)
+    const source = field('source', 200)
+    const destination = field('destination', 200)
+    const transporter = field('transporter', 150)
+    const dateValue = (key, optional = false) => {
+      const value = raw[key]
+      if (optional && (value === '' || value == null)) return ''
+      if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value) || !Number.isFinite(Date.parse(value + ':00Z'))) throw new Error(`Invalid ${key}.`)
+      return value
+    }
+    const dispatchTime = dateValue('dispatchTime')
+    const arrivalTime = dateValue('arrivalTime', true)
+    if (arrivalTime && arrivalTime < dispatchTime) throw new Error('Arrival cannot be before dispatch.')
+    return { shipmentId, source, destination, transporter, dispatchTime, arrivalTime }
+  }
+  if (kind === 'certSubmission') {
+    const cid = field('cid', 120)
+    if (!/^[a-zA-Z0-9]{46,120}$/.test(cid)) throw new Error('Invalid IPFS CID.')
+    const hash = field('hash', 66)
+    if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) throw new Error('Invalid certificate SHA-256.')
+    return { cid, hash: hash.toLowerCase() }
+  }
+  throw new Error('Unsupported metadata type.')
+}
+function requireMetadataOrigin(req, res, next) { return requireLocalOrigin(req, res, next) }
+
+// Public, read-only metadata (does not claim blockchain verification).
+app.get('/api/batches/:batchId/details', async (req, res) => {
+  try {
+    const batch = await verifiedBatch(req.params.batchId)
+    const doc = await database.collection('batchDetails').findOne(metadataKey(req.params.batchId), { projection: { _id: 0 } })
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ chainFarmName: batch.farmName, details: doc ? { farmLocation: doc.farmLocation || '', description: doc.description || '', imageCid: doc.imageCid || '', imageHash: doc.imageHash || '', imageMime: doc.imageMime || '', farmUpdatedBy: doc.farmUpdatedBy || '', quantityKg: doc.quantityKg ?? null, shipments: doc.shipments || [] } : null })
+  } catch (err) { res.status(/Invalid batch|does not exist/.test(err.message) ? 404 : 503).json({ error: err.message }) }
+})
+
+app.post('/api/batches/:batchId/metadata/challenge', requireMetadataOrigin, async (req, res) => {
+  try {
+    const { kind, payload, walletAddress } = req.body || {}
+    if (!validAddress(walletAddress)) return res.status(400).json({ error: 'Invalid wallet.' })
+    const batch = await verifiedBatch(req.params.batchId)
+    const signer = getAddress(walletAddress).toLowerCase()
+    const allowed = kind === 'farm' || kind === 'certSubmission' ? batch.farmer.toLowerCase() === signer : kind === 'shipment' && batch.currentHolder.toLowerCase() === signer
+    if (!allowed) return res.status(403).json({ error: kind === 'certSubmission' ? 'Only the original farmer can submit a certificate.' : kind === 'farm' ? 'Only the batch farmer can edit farm details.' : 'Only the current on-chain holder can record shipment information.' })
+    const clean = validateMetadata(kind, payload)
+    if (kind === 'shipment') {
+      const saved = await database.collection('batchDetails').findOne(metadataKey(req.params.batchId), { projection: { quantityKg: 1 } })
+      const registeredQuantity = Number(saved?.quantityKg)
+      if (!Number.isFinite(registeredQuantity) || registeredQuantity <= 0) return res.status(409).json({ error: 'Original batch quantity is missing. Ask the batch farmer to save its original quantity first.' })
+      clean.quantity = registeredQuantity
+      clean.unit = 'kg'
+    }
+    const nonce = randomBytes(24).toString('hex')
+    const expires = Date.now() + CHALLENGE_LIFETIME_MS
+    const message = ['OrganicTrace off-chain batch metadata', `Chain: ${CHAIN_ID}`, `Contract: ${CONTRACT_ADDRESS.toLowerCase()}`, `Batch: ${req.params.batchId}`, `Kind: ${kind}`, `Signer: ${signer}`, `Data: ${JSON.stringify(clean)}`, `Nonce: ${nonce}`, `Expiry: ${new Date(expires).toISOString()}`].join('\n')
+    for (const [key, challenge] of metadataChallenges) if (challenge.expires <= Date.now()) metadataChallenges.delete(key)
+    metadataChallenges.set(nonce, { kind, payload: clean, signer, batchId: req.params.batchId, expires, message })
+    res.json({ nonce, message })
+  } catch (err) { res.status(400).json({ error: err.message }) }
+})
+
+app.put('/api/batches/:batchId/metadata', requireMetadataOrigin, metadataImageUpload.single('image'), async (req, res) => {
+  try {
+    const { nonce, signature } = req.body || {}
+    if (typeof nonce !== 'string' || typeof signature !== 'string') return res.status(400).json({ error: 'Signature required.' })
+    const challenge = metadataChallenges.get(nonce)
+    if (!challenge) return res.status(401).json({ error: 'Challenge missing or already used.' })
+    metadataChallenges.delete(nonce) // single use, even after failure
+    if (challenge.expires < Date.now() || challenge.batchId !== req.params.batchId) return res.status(401).json({ error: 'Challenge expired or invalid.' })
+    if (verifyMessage(challenge.message, signature).toLowerCase() !== challenge.signer) return res.status(403).json({ error: 'Invalid wallet signature.' })
+    const batch = await verifiedBatch(req.params.batchId)
+    const currentlyAuthorized = (challenge.kind === 'farm' || challenge.kind === 'certSubmission') ? batch.farmer.toLowerCase() === challenge.signer : batch.currentHolder.toLowerCase() === challenge.signer
+    if (!currentlyAuthorized) return res.status(403).json({ error: 'Signer no longer owns the required on-chain authorization.' })
+    const key = metadataKey(req.params.batchId)
+    const now = new Date()
+    if (challenge.kind === 'farm') {
+      if (!!req.file !== !!challenge.payload.imageHash) return res.status(400).json({ error: 'Image must match signed request.' })
+      let imageFields = {}
+      if (req.file) {
+        const mime = imageMimeFromMagic(req.file.buffer)
+        if (!mime || mime !== req.file.mimetype || sha256(req.file.buffer) !== challenge.payload.imageHash) return res.status(400).json({ error: 'Image type or hash mismatch.' })
+        if (!process.env.PINATA_JWT) return res.status(503).json({ error: 'PINATA_JWT is not configured.' })
+        const fd = new FormData()
+        fd.append('file', new Blob([req.file.buffer], { type: mime }), `batch-${req.params.batchId}-${Date.now()}.${mime.split('/')[1] === 'jpeg' ? 'jpg' : mime.split('/')[1]}`)
+        fd.append('network', 'public')
+        const uploadResponse = await fetch('https://uploads.pinata.cloud/v3/files', { method: 'POST', headers: { Authorization: `Bearer ${process.env.PINATA_JWT}` }, body: fd })
+        if (!uploadResponse.ok) throw new Error('Image upload to Pinata failed.')
+        const uploaded = await uploadResponse.json()
+        if (!uploaded.data?.cid) throw new Error('Pinata did not return an image CID.')
+        imageFields = { imageCid: uploaded.data.cid, imageHash: challenge.payload.imageHash, imageMime: mime }
+      }
+      const existingFarm = await database.collection('batchDetails').findOne(key, { projection: { quantityKg: 1 } })
+      const previousQuantity = Number(existingFarm?.quantityKg)
+      if (Number.isFinite(previousQuantity) && previousQuantity > 0 && challenge.payload.quantityKg != null && challenge.payload.quantityKg !== previousQuantity) {
+        return res.status(409).json({ error: 'Original batch quantity cannot be changed after it has been saved.' })
+      }
+      const quantityField = challenge.payload.quantityKg != null && !(Number.isFinite(previousQuantity) && previousQuantity > 0)
+        ? { quantityKg: challenge.payload.quantityKg } : {}
+      await database.collection('batchDetails').updateOne(key, { $set: { farmLocation: challenge.payload.farmLocation, description: challenge.payload.description, farmUpdatedBy: challenge.signer, farmUpdatedAt: now, ...quantityField, ...imageFields }, $setOnInsert: { ...key, createdAt: now } }, { upsert: true })
+    } else if (challenge.kind === 'certSubmission') {
+      if (req.file) return res.status(400).json({ error: 'Unexpected image.' })
+      // A farmer can submit documentation, but only CERTIFIER_ROLE can register it on-chain.
+      await database.collection('batchDetails').updateOne(key, {
+        $set: { pendingCertification: { ...challenge.payload, farmer: challenge.signer, submittedAt: now.toISOString() } },
+        $setOnInsert: { ...key, createdAt: now }
+      }, { upsert: true })
+    } else {
+      const existing = await database.collection('batchDetails').findOne(key, { projection: { shipments: 1 } })
+      if (existing?.shipments?.some(x => x.shipmentId === challenge.payload.shipmentId)) return res.status(409).json({ error: 'Shipment ID already exists for this batch.' })
+      const entry = { ...challenge.payload, recordedBy: challenge.signer, recordedAt: now.toISOString(), recordId: randomBytes(12).toString('hex'), custodyStageAtRecording: Number(batch.stage), recordType: 'off-chain' }
+      await database.collection('batchDetails').updateOne(key, { $push: { shipments: entry }, $setOnInsert: { ...key, createdAt: now } }, { upsert: true })
+    }
+    res.json({ success: true })
+  } catch (err) { console.error('Batch metadata:', err.message); res.status(500).json({ error: 'Could not save batch metadata: ' + err.message }) }
+})
+
+
+// Review queue is available only to an on-chain CERTIFIER_ROLE holder via one-use signed challenge.
+const reviewChallenges = new Map()
+app.post('/api/certification-submissions/challenge', requireLocalOrigin, async (req, res) => {
+  try {
+    const wallet = req.body?.walletAddress
+    if (!validAddress(wallet)) return res.status(400).json({ error: 'Invalid wallet.' })
+    const signer = getAddress(wallet).toLowerCase()
+    if (!await rolesContract.hasRole(await rolesContract.CERTIFIER_ROLE(), signer)) return res.status(403).json({ error: 'Certifier role required.' })
+    const nonce = randomBytes(24).toString('hex')
+    const expires = Date.now() + CHALLENGE_LIFETIME_MS
+    const message = ['OrganicTrace certifier submissions review', `Chain: ${CHAIN_ID}`, `Contract: ${CONTRACT_ADDRESS.toLowerCase()}`, `Signer: ${signer}`, `Nonce: ${nonce}`, `Expires: ${new Date(expires).toISOString()}`].join('\n')
+    for (const [key, item] of reviewChallenges) if (item.expires <= Date.now()) reviewChallenges.delete(key)
+    reviewChallenges.set(nonce, { signer, expires, message })
+    res.json({ nonce, message })
+  } catch (err) { res.status(503).json({ error: 'Could not verify certifier role.' }) }
+})
+app.post('/api/certification-submissions/list', requireLocalOrigin, async (req, res) => {
+  try {
+    const { nonce, signature } = req.body || {}
+    if (typeof nonce !== 'string' || typeof signature !== 'string') return res.status(400).json({ error: 'Signature required.' })
+    const challenge = reviewChallenges.get(nonce)
+    if (!challenge) return res.status(401).json({ error: 'Invalid or already used challenge.' })
+    reviewChallenges.delete(nonce)
+    if (challenge.expires < Date.now() || verifyMessage(challenge.message, signature).toLowerCase() !== challenge.signer) return res.status(401).json({ error: 'Invalid or expired signature.' })
+    if (!await rolesContract.hasRole(await rolesContract.CERTIFIER_ROLE(), challenge.signer)) return res.status(403).json({ error: 'Certifier role required.' })
+    const docs = await database.collection('batchDetails').find(
+      { chainId: Number(CHAIN_ID), contractAddress: CONTRACT_ADDRESS.toLowerCase(), pendingCertification: { $exists: true } },
+      { projection: { _id: 0, batchId: 1, pendingCertification: 1 } }
+    ).limit(200).toArray()
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ submissions: docs.map(doc => ({ batchId: doc.batchId, ...doc.pendingCertification })) })
+  } catch (err) { res.status(503).json({ error: 'Cannot load certificate submissions.' }) }
+})
+
+// Serve the Vite production build from frontend/dist on the same public domain.
+// This is independent of the API routes and leaves /health available for EthioDeploy.
+const frontendDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist')
+app.use(express.static(frontendDist, { index: 'index.html' }))
+
+// React client-side routes should load the SPA, but unknown API routes and
+// missing asset files must return 404 rather than index.html.
+app.get(/.*/, (req, res, next) => {
+  if (req.path === '/upload' || req.path.startsWith('/api/') || req.path === '/api' ||
+      req.path === '/health' || path.posix.extname(req.path)) {
+    return next()
+  }
+  res.sendFile(path.join(frontendDist, 'index.html'), (error) => {
+    if (error) next(error)
+  })
 })
 
 // Handle upload errors.
