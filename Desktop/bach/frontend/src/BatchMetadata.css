@@ -1,0 +1,29 @@
+.metadata-editor { display:grid; gap:22px; }
+.metadata-editor .form-card { min-width:0; }
+.metadata-editor textarea { width:100%; min-height:94px; padding:12px; border:1px solid var(--border); border-radius:9px; font:inherit; resize:vertical; }
+.metadata-editor input[type=file] { max-width:100%; font-size:12px; }
+.metadata-editor .error-message, .metadata-editor .success-message { margin-top:14px; }
+.metadata-display { margin:22px 0; padding:25px; border:1px solid var(--border); border-radius:15px; }
+.metadata-display h3 { margin-top:23px; font-size:16px; }
+.batch-photo { display:block; width:100%; max-height:340px; object-fit:contain; background:#eef4ef; border-radius:12px; margin:15px 0; }
+.shipment-card { padding:16px; background:#fff; border:1px solid var(--border); border-radius:11px; margin:12px 0; }
+.shipment-card > .mini-tag { margin-left:12px; }
+
+/* Inline details for the Food batches summary. */
+.batch-extra-summary { margin-top: 16px; padding-top: 4px; }
+.batch-extra-summary .detail-list { margin-top: 0; }
+.batch-extra-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.batch-summary-photo { display:block; width:100%; max-height:240px; object-fit:cover; border-radius:12px; margin:6px 0 16px; background:#edf3ed; }
+
+/* Only shown for legacy batches missing their original quantity. */
+.batch-legacy-quantity-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+  padding: 18px;
+  border: 1px solid var(--border, #dce7dd);
+  background: #f7faf7;
+  border-radius: 12px;
+}
+.batch-legacy-quantity-form .field { min-width: 0; }
+.batch-legacy-quantity-form .button-outline { width: 100%; }

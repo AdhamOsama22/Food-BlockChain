@@ -1,0 +1,100 @@
+/* Blockchain explorer: three focused navigation cards with on-demand detail panels. */
+.ot-explorer-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+}
+.ot-explorer-nav-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  min-height: 235px;
+  padding: 25px;
+  text-align: left;
+  color: var(--ink, #1e332b);
+  background: #fff;
+  border: 1px solid var(--border, #e3eae5);
+  border-radius: 18px;
+  box-shadow: 0 10px 28px rgba(18, 60, 38, .045);
+  transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+  cursor: pointer;
+}
+.ot-explorer-nav-card:hover,
+.ot-explorer-nav-card:focus-visible {
+  transform: translateY(-3px);
+  border-color: #8dbda0;
+  box-shadow: 0 14px 32px rgba(22, 74, 53, .11);
+}
+.ot-explorer-nav-card.is-active {
+  border-color: #2b7a54;
+  background: linear-gradient(160deg, #f0f8f1 0%, #fff 72%);
+  box-shadow: 0 10px 24px rgba(22, 74, 53, .09);
+}
+.ot-explorer-card-icon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 13px;
+  background: #e9f4ed;
+  color: #246944;
+  font-size: 26px;
+  font-weight: 650;
+  margin-bottom: 20px;
+}
+.ot-explorer-card-kicker {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1.1px;
+  color: #28734d;
+  margin-bottom: 8px;
+}
+.ot-explorer-nav-card > strong {
+  font-size: clamp(18px, 2vw, 23px);
+  font-weight: 800;
+  letter-spacing: -.45px;
+  margin-bottom: 9px;
+}
+.ot-explorer-card-description {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #65776b;
+  flex: 1;
+}
+.ot-explorer-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin-top: 23px;
+  padding-top: 16px;
+  border-top: 1px solid #e6eee8;
+  font-size: 12px;
+  color: #215f3f;
+  font-weight: 750;
+}
+.ot-explorer-card-footer > span:last-child { font-size: 21px; line-height: 1; }
+.ot-explorer-panel { padding: clamp(20px, 3vw, 32px); }
+.ot-explorer-panel-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #e3eae5;
+  margin-bottom: 10px;
+}
+.ot-explorer-panel-heading h2 { margin: 9px 0 0; font-size: 21px; }
+.ot-explorer-panel-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 24px; }
+.ot-explorer-panel-list > p { grid-column: 1 / -1; }
+.ot-explorer-panel-list .explorer-batch-row { min-width: 0; }
+@media (max-width: 950px) {
+  .ot-explorer-cards { gap: 12px; }
+  .ot-explorer-nav-card { padding: 18px; min-height: 220px; }
+}
+@media (max-width: 720px) {
+  .ot-explorer-cards { grid-template-columns: 1fr; }
+  .ot-explorer-nav-card { min-height: 0; }
+  .ot-explorer-panel-list { grid-template-columns: 1fr; }
+}

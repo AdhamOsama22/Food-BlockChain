@@ -1,0 +1,1320 @@
+
+import { useEffect, useState } from 'react'
+import { BrowserProvider, Contract, isAddress } from 'ethers'
+import contractArtifact from './contract/OrganicFoodTraceability.json'
+import BatchQRCode from './BatchQRCode'
+import BatchMetadataEditor, { BatchMetadataView, BatchMetadataSummary, fetchBatchMetadata, saveSignedMetadata, imageSha256 } from './BatchMetadata'
+import PublicConsumer from './PublicConsumer'
+import { CertifierReview, submitFarmerCertificate, CertificateUploadRetry } from './CertificateWorkflow'
+import BlockchainExplorer from './BlockchainExplorer'
+import ProcessingStage from './ProcessingStage'
+import { PROCESSING_ADDRESS, PROCESSING_ABI, processingConfigured } from './processingConfig.js'
+import { participantName, saveParticipantName, walletDisplay, loadParticipantNames } from './participantNames'
+import { CONTRACT_ADDRESS, CHAIN_ID, NETWORK_NAME } from './sepoliaConfig'
+import './App.css'
+
+const STAGES = ['Farmer', 'Distributor', 'Retailer']
+
+const abi = contractArtifact.abi
+
+const registerFunction = abi.find(
+  item => item.type === 'function' && item.name === 'registerBatch'
+)
+
+const transferFunction = abi.find(
+  item => item.type === 'function' && item.name === 'transferBatch'
+)
+
+const certificateFunction = abi.find(
+  item => item.type === 'function' && item.name === 'registerCertificate'
+)
+
+const registrationInputs = registerFunction?.inputs || []
+
+function makeLabel(name, index) {
+  if (!name) return `Field ${index + 1}`
+
+  return name
+    .replace(/([A-Z])/g, ' $1')
+    .replace(/_/g, ' ')
+    .replace(/^./, letter => letter.toUpperCase())
+    .trim()
+}
+
+function convertInput(input, value) {
+  const text = value.trim()
+
+  if (!text) {
+    throw new Error(`${input.name || 'Field'} is required.`)
+  }
+
+  if (input.type.startsWith('uint') || input.type.startsWith('int')) {
+    if (/date/i.test(input.name)) {
+      const seconds = Date.parse(`${text}T00:00:00Z`) / 1000
+
+      if (!Number.isFinite(seconds)) {
+        throw new Error('Invalid harvest date.')
+      }
+
+      return BigInt(seconds)
+    }
+
+    if (!/^\d+$/.test(text)) {
+      throw new Error(`${input.name} must be a whole number.`)
+    }
+
+    return BigInt(text)
+  }
+
+  return text
+}
+
+function formatDate(timestamp) {
+  const number = Number(timestamp)
+
+  if (!Number.isFinite(number) || number <= 0) {
+    return 'Not available'
+  }
+
+  const date = new Date(number * 1000)
+
+  if (Number.isNaN(date.getTime())) {
+    return 'Invalid date'
+  }
+
+  return date.toLocaleDateString('en-GB', {
+    timeZone: 'UTC',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric'
+  })
+}
+
+function dateToTimestamp(value) {
+  if (!value) {
+    throw new Error('Please enter a date.')
+  }
+
+  const timestamp = Date.parse(`${value}T00:00:00Z`)
+
+  if (!Number.isFinite(timestamp)) {
+    throw new Error('Invalid date.')
+  }
+
+  return BigInt(timestamp / 1000)
+}
+
+async function hashArrayBuffer(buffer) {
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
+
+  return '0x' + Array.from(new Uint8Array(digest))
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function calculateFileHash(file) {
+  return hashArrayBuffer(await file.arrayBuffer())
+}
+
+function makeCertificateArguments(data) {
+  if (!certificateFunction) {
+    throw new Error('registerCertificate was not found in the ABI.')
+  }
+
+  function valueFor(input) {
+    const name = (input.name || '')
+      .replace(/^_+/, '')
+      .toLowerCase()
+
+    if (name.includes('batch') && name.includes('id')) {
+      return BigInt(data.batchId)
+    }
+
+    if (name.includes('certificatenumber') || name === 'number') {
+      return data.number
+    }
+
+    if (name.includes('cid') || name.includes('ipfs')) {
+      return data.cid
+    }
+
+    if (name.includes('hash')) {
+      return data.hash
+    }
+
+    if (name.includes('issue')) {
+      return dateToTimestamp(data.issueDate)
+    }
+
+    if (name.includes('expiry') || name.includes('expiration')) {
+      return dateToTimestamp(data.expiryDate)
+    }
+
+    throw new Error(`Unknown certificate ABI field: ${input.name}`)
+  }
+
+  return certificateFunction.inputs.map(input => {
+    if (input.type === 'tuple') {
+      return input.components.map(component => valueFor(component))
+    }
+
+    return valueFor(input)
+  })
+}
+
+function App() {
+  const [account, setAccount] = useState('')
+  const [contract, setContract] = useState(null)
+
+  const [roles, setRoles] = useState({
+    admin: false,
+    farmer: false,
+    distributor: false,
+    retailer: false,
+    certifier: false
+  })
+
+  const [values, setValues] = useState({})
+  const [nextBatchId, setNextBatchId] = useState(null)
+  const [newFarmLocation, setNewFarmLocation] = useState('')
+  const [newBatchQuantityKg, setNewBatchQuantityKg] = useState('')
+  const [newFarmDescription, setNewFarmDescription] = useState('')
+  const [newFarmImage, setNewFarmImage] = useState(null)
+  const [newCertificatePdf, setNewCertificatePdf] = useState(null)
+  const [farmRetryBatchId, setFarmRetryBatchId] = useState('')
+  const [certificateRetryBatchId, setCertificateRetryBatchId] = useState('')
+  
+
+  const [roleAddress, setRoleAddress] = useState('')
+  const [roleDisplayName, setRoleDisplayName] = useState('')
+  const [nameAddress, setNameAddress] = useState('')
+  const [nameValue, setNameValue] = useState('')
+  const [explorerBatchId, setExplorerBatchId] = useState('')
+  const [roleType, setRoleType] = useState('DISTRIBUTOR_ROLE')
+  const [processingAdmin, setProcessingAdmin] = useState(false)
+
+  const [transferId, setTransferId] = useState('')
+  const [recipientAddress, setRecipientAddress] = useState('')
+  const [transferShipment, setTransferShipment] = useState({ shipmentId: '', source: '', destination: '', transporter: '', dispatchTime: '', arrivalTime: '' })
+  const [shipmentTransferStatus, setShipmentTransferStatus] = useState('')
+
+  const [searchId, setSearchId] = useState('')
+  const [batch, setBatch] = useState(null)
+
+  const [certificateBatchId, setCertificateBatchId] = useState('')
+  const [certificateNumber, setCertificateNumber] = useState('')
+  const [certificateCid, setCertificateCid] = useState('')
+  const [certificateIssueDate, setCertificateIssueDate] = useState('')
+  const [certificateExpiryDate, setCertificateExpiryDate] = useState('')
+  const [certificateFile, setCertificateFile] = useState(null)
+  const [certificateHash, setCertificateHash] = useState('')
+  const [uploadedHash, setUploadedHash] = useState('')
+  const [uploading, setUploading] = useState(false)
+
+  const [certificateSearchId, setCertificateSearchId] = useState('')
+  const [certificateDetails, setCertificateDetails] = useState(null)
+  const [revokeBatchId, setRevokeBatchId] = useState('')
+
+  // New: result of comparing the IPFS PDF with the blockchain hash.
+  const [verification, setVerification] = useState(null)
+  const [verifying, setVerifying] = useState(false)
+
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [activeView, setActiveView] = useState(() => new URLSearchParams(window.location.search).get('consumer') === '1' ? 'consumer' : 'overview')
+  const [initialConsumerId] = useState(() => new URLSearchParams(window.location.search).get('batch') || '')
+
+  useEffect(() => {
+    loadParticipantNames().catch(err => console.warn('MongoDB names unavailable:', err.message))
+  }, [])
+
+  useEffect(() => {
+    if (!window.ethereum) return
+
+    const handleChange = () => window.location.reload()
+
+    window.ethereum.on('accountsChanged', handleChange)
+    window.ethereum.on('chainChanged', handleChange)
+
+    return () => {
+      window.ethereum.removeListener('accountsChanged', handleChange)
+      window.ethereum.removeListener('chainChanged', handleChange)
+    }
+  }, [])
+
+  function showError(err) {
+    console.error(err)
+    setMessage('')
+    setError(
+      err.shortMessage ||
+      err.reason ||
+      err.message ||
+      'Operation failed.'
+    )
+  }
+
+  async function connectWallet() {
+    setMessage('')
+    setError('')
+    setLoading(true)
+    setAccount('')
+    setContract(null)
+    setProcessingAdmin(false)
+    setBatch(null)
+    setCertificateDetails(null)
+    setVerification(null)
+
+    try {
+      if (!window.ethereum) {
+        throw new Error('MetaMask is not installed.')
+      }
+
+      const provider = new BrowserProvider(window.ethereum)
+      await provider.send('eth_requestAccounts', [])
+
+      const network = await provider.getNetwork()
+
+      if (network.chainId !== CHAIN_ID) {
+        throw new Error('Please select Sepolia (chain ID 11155111) in MetaMask.')
+      }
+
+      const code = await provider.getCode(CONTRACT_ADDRESS)
+
+      if (code === '0x') {
+        throw new Error('OrganicTrace contract not found on Sepolia. Check the contract address.')
+      }
+
+      const signer = await provider.getSigner()
+      const walletAddress = await signer.getAddress()
+
+      const foodContract = new Contract(
+        CONTRACT_ADDRESS,
+        abi,
+        signer
+      )
+
+      const [
+        adminRole,
+        farmerRole,
+        distributorRole,
+        retailerRole,
+        certifierRole
+      ] = await Promise.all([
+        foodContract.DEFAULT_ADMIN_ROLE(),
+        foodContract.FARMER_ROLE(),
+        foodContract.DISTRIBUTOR_ROLE(),
+        foodContract.RETAILER_ROLE(),
+        foodContract.CERTIFIER_ROLE()
+      ])
+
+      const [
+        admin,
+        farmer,
+        distributor,
+        retailer,
+        certifier,
+        nextId
+      ] = await Promise.all([
+        foodContract.hasRole(adminRole, walletAddress),
+        foodContract.hasRole(farmerRole, walletAddress),
+        foodContract.hasRole(distributorRole, walletAddress),
+        foodContract.hasRole(retailerRole, walletAddress),
+        foodContract.hasRole(certifierRole, walletAddress),
+        foodContract.nextBatchId()
+      ])
+
+      setAccount(walletAddress)
+      setContract(foodContract)
+      setRoles({ admin, farmer, distributor, retailer, certifier })
+      if (processingConfigured) {
+        try {
+          const processorContract = new Contract(PROCESSING_ADDRESS, PROCESSING_ABI, signer)
+          const deployedCode = await provider.getCode(PROCESSING_ADDRESS)
+          if (deployedCode !== '0x' && (await processorContract.foodTraceability()).toLowerCase() === CONTRACT_ADDRESS.toLowerCase()) {
+            setProcessingAdmin(await processorContract.hasRole(await processorContract.DEFAULT_ADMIN_ROLE(), walletAddress))
+          }
+        } catch (processingError) {
+          console.warn('Processing Admin role could not be loaded:', processingError)
+        }
+      }
+      setNextBatchId(nextId.toString())
+
+      setMessage('Wallet and smart contract connected successfully!')
+    } catch (err) {
+      showError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function saveNameLabel(event) {
+    event.preventDefault()
+    try {
+      setLoading(true)
+      await saveParticipantName(nameAddress.trim(), nameValue)
+      setError('')
+      setMessage('Participant name saved to MongoDB Atlas.')
+    } catch (err) { showError(err) } finally { setLoading(false) }
+  }
+
+  function openBatchExplorer(id) {
+    setExplorerBatchId(String(id))
+    setActiveView('explorer')
+  }
+
+  async function grantRole(event) {
+    event.preventDefault()
+    setError('')
+    setMessage('')
+
+    if (!contract || (roleType === 'PROCESSOR_ROLE' ? !processingAdmin : !roles.admin)) {
+      setError('The connected wallet is not an administrator of the selected contract.')
+      return
+    }
+
+    if (!isAddress(roleAddress.trim())) {
+      setError('Enter a valid wallet address.')
+      return
+    }
+
+    if (!roleDisplayName.trim()) {
+      setError('Participant name is required before granting a role.')
+      return
+    }
+
+    setLoading(true)
+
+    try {
+      const selectedRole = roleType
+      const address = roleAddress.trim()
+      if (selectedRole === 'PROCESSOR_ROLE') {
+        if (!processingConfigured) throw new Error('Processing contract is not configured.')
+        const processorContract = new Contract(PROCESSING_ADDRESS, PROCESSING_ABI, await new BrowserProvider(window.ethereum).getSigner())
+        const adminRole = await processorContract.DEFAULT_ADMIN_ROLE()
+        if (!(await processorContract.hasRole(adminRole, account))) throw new Error('Only the Processing contract Admin can grant Processor roles.')
+        const processorRole = await processorContract.PROCESSOR_ROLE()
+        let newlyGranted = false
+        if (!(await processorContract.hasRole(processorRole, address))) {
+          const tx = await processorContract.grantRole(processorRole, address)
+          setMessage('Waiting for Processor role confirmation...')
+          const receipt = await tx.wait()
+          if (receipt.status !== 1) throw new Error('Processor role transaction failed.')
+          newlyGranted = true
+        }
+        try {
+          await saveParticipantName(address, roleDisplayName)
+          setMessage(newlyGranted ? 'Processor role granted; participant name saved.' : 'Processor already approved; participant name saved.')
+        } catch (nameError) {
+          setMessage((newlyGranted ? 'Processor role granted' : 'Processor already approved') + ', but participant name was not saved: ' + nameError.message)
+        }
+        setRoleDisplayName('')
+        setRoleAddress('')
+        return
+      }
+      const role = await contract[selectedRole]()
+
+      if (await contract.hasRole(role, address)) {
+        await saveParticipantName(address, roleDisplayName)
+        setMessage('Role already granted. Participant name saved in MongoDB.')
+        return
+      }
+
+      const tx = await contract.grantRole(role, address)
+      setMessage('Waiting for role transaction confirmation...')
+
+      const receipt = await tx.wait()
+
+      if (receipt.status !== 1) {
+        throw new Error('Role transaction failed.')
+      }
+
+      try {
+        await saveParticipantName(address, roleDisplayName)
+        setMessage('Role granted successfully! Participant name saved in MongoDB.')
+      } catch (saveError) {
+        setMessage('Role granted on-chain, but participant name was NOT saved in MongoDB: ' + saveError.message)
+      }
+      setRoleDisplayName('')
+      setRoleAddress('')
+
+      if (address.toLowerCase() === account.toLowerCase()) {
+        const roleKey = {
+          FARMER_ROLE: 'farmer',
+          DISTRIBUTOR_ROLE: 'distributor',
+          RETAILER_ROLE: 'retailer',
+          CERTIFIER_ROLE: 'certifier'
+        }[selectedRole]
+
+        setRoles(previous => ({ ...previous, [roleKey]: true }))
+      }
+    } catch (err) {
+      showError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function registerBatch(event) {
+    event.preventDefault()
+    setError('')
+    setMessage('')
+
+    if (!contract || !roles.farmer) {
+      setError('You need the Farmer role.')
+      return
+    }
+
+    setLoading(true)
+
+    try {
+      const parsedBatchQuantity = Number(newBatchQuantityKg)
+      if (!newBatchQuantityKg.trim() || !Number.isFinite(parsedBatchQuantity) || parsedBatchQuantity <= 0 || parsedBatchQuantity > 1e12) throw new Error('Enter a positive batch quantity in kg.')
+      if (newFarmImage && (!['image/jpeg', 'image/png', 'image/webp'].includes(newFarmImage.type) || newFarmImage.size > 5 * 1024 * 1024)) throw new Error('Choose a JPG, PNG or WebP product image up to 5 MB.')
+      if (newCertificatePdf && (newCertificatePdf.type !== 'application/pdf' && !newCertificatePdf.name.toLowerCase().endsWith('.pdf') || newCertificatePdf.size > 10 * 1024 * 1024)) throw new Error('Choose a certificate PDF up to 10 MB.')
+      const args = registrationInputs.map((input, index) =>
+        convertInput(input, values[index] || '')
+      )
+
+      const tx = await contract.registerBatch(...args)
+      setMessage('Waiting for batch registration...')
+
+      const receipt = await tx.wait()
+
+      if (receipt.status !== 1) {
+        throw new Error('Batch registration failed.')
+      }
+
+      // Derive this batch ID from this confirmed transaction's event, rather
+      // than nextBatchId - 1 (which can be wrong if another farmer registers
+      // a batch before our counter read finishes).
+      let createdId = null
+      for (const log of receipt.logs || []) {
+        try {
+          if (log.address?.toLowerCase() !== CONTRACT_ADDRESS.toLowerCase()) continue
+          const parsed = contract.interface.parseLog(log)
+          if (parsed?.name === 'BatchRegistered') {
+            createdId = BigInt(parsed.args.batchId ?? parsed.args[0])
+            break
+          }
+        } catch { /* Ignore logs unrelated to this contract's registration. */ }
+      }
+      if (createdId === null) {
+        throw new Error(`Registration transaction ${receipt.hash} succeeded, but its batch ID could not be read. Do not register another batch; inspect this transaction on Sepolia Etherscan.`)
+      }
+      const updatedNextId = await contract.nextBatchId()
+      setNextBatchId(updatedNextId.toString())
+      setValues({})
+      setSearchId(createdId.toString())
+      setBatch(await loadBatch(createdId))
+
+      setFarmRetryBatchId('')
+      setCertificateRetryBatchId('')
+      const warnings = []
+      try {
+        await saveSignedMetadata(createdId.toString(), 'farm', {
+          farmLocation: newFarmLocation,
+          description: newFarmDescription,
+          quantityKg: parsedBatchQuantity,
+          imageHash: newFarmImage ? await imageSha256(newFarmImage) : ''
+        }, newFarmImage)
+        setNewFarmLocation(''); setNewFarmDescription(''); setNewBatchQuantityKg(''); setNewFarmImage(null)
+      } catch (detailsError) {
+        setFarmRetryBatchId(createdId.toString())
+        warnings.push(`Farm details not saved: ${detailsError.message}`)
+      }
+      const certificateWasSelected = !!newCertificatePdf
+      if (newCertificatePdf) {
+        try {
+          await submitFarmerCertificate(createdId.toString(), newCertificatePdf)
+          setNewCertificatePdf(null)
+        } catch (certificateError) {
+          setCertificateRetryBatchId(createdId.toString())
+          warnings.push(`Certificate not submitted: ${certificateError.message}`)
+        }
+      }
+      setMessage(warnings.length
+        ? `Batch #${createdId} registered on Sepolia. ${warnings.join(' | ')} Do not register a duplicate batch; use the recovery form below.`
+        : `Batch #${createdId} registered. Farm details saved${certificateWasSelected ? ' and certificate submitted for review' : ''}.`)
+
+    } catch (err) {
+      showError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function loadBatch(id) {
+    if (!contract) {
+      throw new Error('Connect MetaMask first.')
+    }
+
+    const nextId = await contract.nextBatchId()
+
+    if (id <= 0n || id >= nextId) {
+      throw new Error(`Batch #${id} does not exist.`)
+    }
+
+    const result = await contract.batches(id)
+
+    if (!result.exists) {
+      throw new Error(`Batch #${id} does not exist.`)
+    }
+
+    return {
+      id: id.toString(),
+      productName: result.productName,
+      farmName: result.farmName,
+      harvestDate: formatDate(result.harvestDate),
+      farmer: result.farmer,
+      currentHolder: result.currentHolder,
+      stage: STAGES[Number(result.stage)] ?? 'Unknown'
+    }
+  }
+
+  async function viewBatch(event) {
+    event.preventDefault()
+    setError('')
+    setMessage('')
+    setBatch(null)
+    setLoading(true)
+
+    try {
+      if (!/^[1-9]\d*$/.test(searchId.trim())) {
+        throw new Error('Enter a valid batch ID.')
+      }
+
+      setBatch(await loadBatch(BigInt(searchId.trim())))
+    } catch (err) {
+      showError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function transferBatch(event) {
+    event.preventDefault()
+    setError('')
+    setMessage('')
+    setShipmentTransferStatus('')
+    setLoading(true)
+
+    let shipmentConfirmed = false
+    let transferConfirmed = false
+    try {
+      if (!contract || !account) throw new Error('Connect MetaMask first.')
+      if (!/^[1-9]\d*$/.test(transferId.trim())) throw new Error('Enter a valid Batch ID.')
+      if (!isAddress(recipientAddress.trim())) throw new Error('Enter a valid recipient address.')
+
+      const id = BigInt(transferId.trim())
+      const existing = await loadBatch(id)
+      if (existing.currentHolder.toLowerCase() !== account.toLowerCase()) {
+        throw new Error('Only the current on-chain holder can submit shipment information and transfer this batch.')
+      }
+      let requiredRole
+      if (existing.stage === 'Farmer') {
+        if (!roles.farmer) throw new Error('You need the Farmer role.')
+        requiredRole = await contract.DISTRIBUTOR_ROLE()
+      } else if (existing.stage === 'Distributor') {
+        if (!roles.distributor) throw new Error('You need the Distributor role.')
+        requiredRole = await contract.RETAILER_ROLE()
+      } else {
+        throw new Error('This batch is already at the Retailer stage.')
+      }
+      if (!await contract.hasRole(requiredRole, recipientAddress.trim())) {
+        throw new Error('The recipient does not have the required next-stage role.')
+      }
+      if (!transferFunction || transferFunction.inputs.length !== 2) {
+        throw new Error('Unexpected transferBatch ABI.')
+      }
+
+      // A single screen, but two separate systems: MongoDB save then Sepolia transaction.
+      // Preflight BEFORE signing prevents failed transfers from creating unnecessary shipments.
+      const payload = Object.fromEntries(Object.entries(transferShipment).map(([key, value]) => [key, value.trim()]))
+      for (const key of ['shipmentId', 'source', 'destination', 'transporter', 'dispatchTime']) {
+        if (!payload[key]) throw new Error(`Enter shipment ${key.replace(/([A-Z])/g, ' $1').toLowerCase()}.`)
+      }
+      if (payload.arrivalTime && payload.arrivalTime < payload.dispatchTime) {
+        throw new Error('Arrival time cannot be before dispatch time.')
+      }
+
+      const metadata = await fetchBatchMetadata(id.toString())
+      if (!(Number(metadata.details?.quantityKg) > 0)) {
+        throw new Error('The original batch quantity is missing. The Farmer must save it before this shipment can be recorded.')
+      }
+      // A previous click may have saved the shipment but failed to transfer due to
+      // MetaMask rejection or insufficient gas. Reuse only an EXACT matching record,
+      // signed by this wallet, so retrying cannot duplicate or hijack another shipment.
+      const saved = (metadata.details?.shipments || []).find(s => s.shipmentId === payload.shipmentId)
+      if (saved) {
+        const matches = ['shipmentId', 'source', 'destination', 'transporter', 'dispatchTime', 'arrivalTime']
+          .every(key => (saved[key] || '') === (payload[key] || ''))
+        if (!matches || saved.recordedBy?.toLowerCase() !== account.toLowerCase() || Number(saved.custodyStageAtRecording) !== STAGES.indexOf(existing.stage)) {
+          throw new Error('This Shipment ID already belongs to a different shipment. Enter a unique Shipment ID.')
+        }
+        shipmentConfirmed = true
+        setShipmentTransferStatus('The matching shipment was already saved. Retrying only the blockchain transfer.')
+      } else {
+        setMessage('Step 1 of 2: Sign the transportation details with MetaMask...')
+        await saveSignedMetadata(id.toString(), 'shipment', payload, null)
+        shipmentConfirmed = true
+        setShipmentTransferStatus('Shipment saved to MongoDB. Ownership transfer is next.')
+      }
+
+      const idPosition = transferFunction.inputs.findIndex(input => input.type.startsWith('uint'))
+      const addressPosition = transferFunction.inputs.findIndex(input => input.type === 'address')
+      if (idPosition < 0 || addressPosition < 0) throw new Error('Unexpected transferBatch parameters.')
+      const args = new Array(2)
+      args[idPosition] = id
+      args[addressPosition] = recipientAddress.trim()
+      setMessage('Step 2 of 2: Confirm the ownership transfer in MetaMask...')
+      const tx = await contract.transferBatch(...args)
+      const receipt = await tx.wait()
+      if (receipt.status !== 1) throw new Error('The blockchain transfer transaction failed.')
+      transferConfirmed = true
+      const updated = await loadBatch(id)
+      setBatch(updated)
+      setSearchId(id.toString())
+      setTransferId('')
+      setRecipientAddress('')
+      setTransferShipment({ shipmentId: '', source: '', destination: '', transporter: '', dispatchTime: '', arrivalTime: '' })
+      setShipmentTransferStatus('')
+      setMessage(`Shipment saved and Batch #${id} transferred successfully to ${updated.stage}!`)
+    } catch (err) {
+      if (shipmentConfirmed && !transferConfirmed) {
+        console.error('Transfer failed after shipment save:', err)
+        setMessage('')
+        setShipmentTransferStatus('Shipment saved successfully. The batch was NOT transferred. Keep the same Shipment ID and try Submit & transfer again; your shipment will not be duplicated.')
+        setError(err.shortMessage || err.reason || err.message || 'Blockchain transfer failed.')
+      } else {
+        showError(err)
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleCertificateFile(event) {
+    const file = event.target.files?.[0] || null
+
+    setCertificateFile(null)
+    setCertificateHash('')
+    setCertificateCid('')
+    setUploadedHash('')
+    setMessage('')
+    setError('')
+
+    if (!file) return
+
+    if (
+      file.type !== 'application/pdf' &&
+      !file.name.toLowerCase().endsWith('.pdf')
+    ) {
+      setError('Please select a PDF file.')
+      return
+    }
+
+    try {
+      const hash = await calculateFileHash(file)
+      setCertificateFile(file)
+      setCertificateHash(hash)
+    } catch (err) {
+      showError(err)
+    }
+  }
+
+  // Upload the selected PDF through our local server, not from React to Pinata.
+  async function uploadCertificateToIpfs() {
+    setError('')
+    setMessage('')
+
+    if (!contract || !roles.certifier) {
+      setError('Connect an authorised Certifier wallet first.')
+      return
+    }
+
+    if (!certificateFile || !certificateHash) {
+      setError('Choose a PDF certificate first.')
+      return
+    }
+
+    setUploading(true)
+    setCertificateCid('')
+    setUploadedHash('')
+
+    try {
+      const formData = new FormData()
+      formData.append('file', certificateFile)
+
+      const response = await fetch(`${(import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:3001').replace(/\/$/, '')}/upload`, {
+        method: 'POST',
+        body: formData
+      })
+
+      let result
+      try {
+        result = await response.json()
+      } catch {
+        throw new Error('Upload server returned an invalid response.')
+      }
+
+      if (!response.ok) {
+        throw new Error(result.error || `Upload failed (HTTP ${response.status}).`)
+      }
+
+      if (!result.cid || !/^[a-zA-Z0-9]{46,100}$/.test(result.cid)) {
+        throw new Error('Pinata did not return a valid IPFS CID.')
+      }
+
+      setCertificateCid(result.cid)
+      setUploadedHash(certificateHash)
+      setMessage('PDF uploaded to Pinata successfully! CID filled automatically.')
+    } catch (err) {
+      showError(err)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function registerCertificate(event) {
+    event.preventDefault()
+    setError('')
+    setMessage('')
+
+    if (!contract || !roles.certifier) {
+      setError('Connect a wallet with the Certifier role.')
+      return
+    }
+
+    setLoading(true)
+
+    try {
+      if (!/^[1-9]\d*$/.test(certificateBatchId.trim())) {
+        throw new Error('Enter a valid Batch ID.')
+      }
+
+      if (!certificateFile || !certificateHash) {
+        throw new Error('Select a certificate PDF first.')
+      }
+
+      if (!certificateNumber.trim() || !certificateCid.trim()) {
+        throw new Error('Enter the certificate number and upload the PDF first.')
+      }
+
+      if (uploadedHash !== certificateHash) {
+        throw new Error('Upload this selected PDF to IPFS before registering.')
+      }
+
+      const issue = dateToTimestamp(certificateIssueDate)
+      const expiry = dateToTimestamp(certificateExpiryDate)
+
+      if (expiry <= issue) {
+        throw new Error('Expiry date must be after issue date.')
+      }
+
+      if (expiry <= BigInt(Math.floor(Date.now() / 1000))) {
+        throw new Error('Certificate expiry date must be in the future.')
+      }
+
+      await loadBatch(BigInt(certificateBatchId.trim()))
+
+      const args = makeCertificateArguments({
+        batchId: certificateBatchId.trim(),
+        number: certificateNumber.trim(),
+        cid: certificateCid.trim(),
+        hash: certificateHash,
+        issueDate: certificateIssueDate,
+        expiryDate: certificateExpiryDate
+      })
+
+      const tx = await contract.registerCertificate(...args)
+      setMessage('Waiting for certificate registration confirmation...')
+
+      const receipt = await tx.wait()
+
+      if (receipt.status !== 1) {
+        throw new Error('Certificate registration failed.')
+      }
+
+      setCertificateSearchId(certificateBatchId.trim())
+      setCertificateDetails(null)
+      setVerification(null)
+
+      setMessage(`Certificate registered successfully! Transaction: ${tx.hash}`)
+    } catch (err) {
+      showError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function revokeCertificate(event) {
+    event.preventDefault()
+    setError('')
+    setMessage('')
+
+    if (!contract || (!roles.certifier && !roles.admin)) {
+      setError('Only an authorised Certifier or Administrator can revoke a certificate.')
+      return
+    }
+
+    const textId = revokeBatchId.trim()
+    if (!/^[1-9]\d*$/.test(textId)) {
+      setError('Enter a valid batch ID.')
+      return
+    }
+
+    setLoading(true)
+
+    try {
+      const id = BigInt(textId)
+      const existing = await contract.getCertificate(id)
+
+      if (!(existing.exists ?? existing[6])) {
+        throw new Error(`Batch #${textId} has no registered certificate.`)
+      }
+
+      if (existing.revoked ?? existing[7]) {
+        throw new Error('This certificate is already revoked.')
+      }
+
+      // This sends a transaction only when the user explicitly confirms it in MetaMask.
+      const tx = await contract.revokeCertificate(id)
+      setMessage('Waiting for certificate revocation confirmation...')
+      const receipt = await tx.wait()
+
+      if (receipt.status !== 1) {
+        throw new Error('Certificate revocation transaction failed.')
+      }
+
+      const updated = await contract.getCertificate(id)
+      const revoked = updated.revoked ?? updated[7]
+      const valid = await contract.isCertificateValid(id)
+
+      if (!revoked || valid) {
+        throw new Error('Transaction confirmed, but the certificate status did not update as expected.')
+      }
+
+      // Update any currently displayed certificate if it is the same batch.
+      setCertificateDetails(previous => {
+        if (!previous || previous.batchId !== textId) return previous
+        return { ...previous, revoked: true, valid: false }
+      })
+      setCertificateSearchId(textId)
+      setRevokeBatchId('')
+      setMessage(`Certificate for Batch #${textId} revoked successfully!`)
+    } catch (err) {
+      showError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function viewCertificate(event) {
+    event.preventDefault()
+    setError('')
+    setMessage('')
+    setCertificateDetails(null)
+    setVerification(null)
+    setLoading(true)
+
+    try {
+      if (!contract) {
+        throw new Error('Connect MetaMask first.')
+      }
+
+      if (!/^[1-9]\d*$/.test(certificateSearchId.trim())) {
+        throw new Error('Enter a valid Batch ID.')
+      }
+
+      const id = BigInt(certificateSearchId.trim())
+      const result = await contract.getCertificate(id)
+
+      const details = {
+        batchId: id.toString(),
+        number: result.certificateNumber ?? result[0],
+        cid: result.ipfsCid ?? result[1],
+        hash: result.fileHash ?? result[2],
+        issueDate: formatDate(result.issueDate ?? result[3]),
+        expiryDate: formatDate(result.expiryDate ?? result[4]),
+        issuer: result.certifier ?? result[5],
+        exists: result.exists ?? result[6],
+        revoked: result.revoked ?? result[7],
+        valid: await contract.isCertificateValid(id)
+      }
+
+      if (!details.exists) {
+        throw new Error('No certificate registered for this batch.')
+      }
+
+      setCertificateDetails(details)
+    } catch (err) {
+      showError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // NEW: Download the actual PDF from IPFS and check its hash.
+  async function verifyPdfIntegrity() {
+    if (!certificateDetails) return
+
+    setVerification(null)
+    setVerifying(true)
+
+    try {
+      const { cid, hash } = certificateDetails
+
+      // The CID must be a simple IPFS identifier, not a URL.
+      if (!/^[a-zA-Z0-9]{46,100}$/.test(cid)) {
+        throw new Error('Invalid IPFS CID stored on blockchain.')
+      }
+
+      const url = `https://teal-fantastic-fowl-808.mypinata.cloud/ipfs/${cid}`
+
+      const response = await fetch(url, { cache: 'no-store' })
+
+      if (!response.ok) {
+        throw new Error(
+          `IPFS download failed (HTTP ${response.status}).`
+        )
+      }
+
+      const pdfBytes = await response.arrayBuffer()
+      const actualHash = await hashArrayBuffer(pdfBytes)
+
+      const matches = actualHash.toLowerCase() === hash.toLowerCase()
+
+      setVerification({
+        status: matches ? 'match' : 'mismatch',
+        expectedHash: hash,
+        actualHash
+      })
+    } catch (err) {
+      console.error('PDF integrity verification failed:', err)
+
+      setVerification({
+        status: 'error',
+        message:
+          'Unable to verify the PDF. The IPFS gateway may be unavailable ' +
+          'or may block browser requests. Details: ' + err.message
+      })
+    } finally {
+      setVerifying(false)
+    }
+  }
+
+  const sectionTitles = {
+    overview: ['Overview', 'Everything you need, in one simple workspace.'],
+    batches: ['Food batches', 'Register a product and look up its current details.'],
+    transfers: ['Supply chain transfers', 'Move food between authorised wallets.'],
+    processing: ['Processing facility', 'Verified processing records on Sepolia.'],
+    certificates: ['Certificates', 'Farmer submission and certifier review.'],
+    admin: ['Manage permissions', 'Choose who can take part in your supply chain.'],
+    consumer: ['Consumer verification', 'Public product history and certificates — no MetaMask required.'],
+    explorer: ['Blockchain explorer', 'Explore Sepolia blocks, transactions and product histories.']
+  }
+
+  const navigation = [
+    { id: 'overview', title: 'Overview', glyph: '◫' },
+    { id: 'batches', title: 'Food batches', glyph: '▤' },
+    { id: 'transfers', title: 'Transfers', glyph: '⇄' },
+    { id: 'processing', title: 'Processing', glyph: '▤' },
+    { id: 'certificates', title: 'Certificates', glyph: '◇' },
+    { id: 'admin', title: 'Permissions', glyph: '⚙' },
+    { id: 'consumer', title: 'Consumer', glyph: '▦' },
+    { id: 'explorer', title: 'Blockchain', glyph: '▣' }
+  ]
+
+  return (
+    <div className="app">
+      <header className="header">
+        <div className="header-inner">
+          <button className="brand" type="button" onClick={() => setActiveView('overview')}>
+            <span className="brand-mark" aria-hidden="true">✳</span>
+            <span className="brand-copy"><strong>OrganicTrace</strong><small>Food traceability platform</small></span>
+          </button>
+          <div className="header-actions">
+            <span className="network-pill"><span className="signal-dot" /> {NETWORK_NAME}</span>
+            {(activeView === 'consumer' || activeView === 'explorer') ? <span className="public-pill">Public view · No wallet needed</span> : <button type="button" className="wallet-button" onClick={connectWallet} disabled={loading}>
+              <span aria-hidden="true">◈</span>
+              {account ? `${account.slice(0, 6)}...${account.slice(-4)}` : 'Connect MetaMask'}
+            </button>}
+          </div>
+        </div>
+      </header>
+
+      <div className="workspace">
+        <aside className="sidebar" aria-label="Main navigation">
+          <div className="sidebar-label">WORKSPACE</div>
+          <nav className="nav-items">
+            {navigation.map(item => (
+              <button
+                key={item.id}
+                type="button"
+                className={`nav-link ${activeView === item.id ? 'active' : ''}`}
+                onClick={() => setActiveView(item.id)}
+                aria-current={activeView === item.id ? 'page' : undefined}
+              >
+                <span className="nav-glyph" aria-hidden="true">{item.glyph}</span>
+                {item.title}
+              </button>
+            ))}
+          </nav>
+          <div className="sidebar-bottom">
+            <span className="sidebar-help-icon" aria-hidden="true">ⓘ</span>
+            <div><strong>Local development</strong><small>Product records are on Sepolia. Participant display names come from MongoDB.</small></div>
+          </div>
+        </aside>
+
+        <main className="main-content">
+          <div className="content-wrap">
+            <div className="page-heading">
+              <div>
+                <div className="eyebrow">ORGANIC FOOD / WORKSPACE</div>
+                <h1>{sectionTitles[activeView][0]}</h1>
+                <p>{sectionTitles[activeView][1]}</p>
+              </div>
+              <span className={`connection-pill ${activeView === 'consumer' || activeView === 'explorer' || contract ? 'online' : 'offline'}`}>
+                <span className="signal-dot" />{activeView === 'consumer' || activeView === 'explorer' ? 'Public · Read only' : contract ? 'Contract connected' : 'Not connected'}
+              </span>
+            </div>
+
+            {!contract && activeView !== 'overview' && activeView !== 'consumer' && activeView !== 'explorer' && (
+              <div className="notice neutral" role="status">
+                <span className="notice-symbol">ⓘ</span>
+                <div><strong>Connect your wallet to get started.</strong><p>Use the Connect MetaMask button above, then return to this section.</p></div>
+              </div>
+            )}
+
+            {activeView === 'overview' && (
+              <>
+                <section className="hero-panel">
+                  <div className="hero-copy">
+                    <div className="hero-kicker"><span className="signal-dot" /> TRACEABILITY MADE SIMPLE</div>
+                    <h2>From the farm to the final shelf.</h2>
+                    <p>Register organic products, record ownership transfers and verify certificates on the blockchain — all in one place.</p>
+                    <div className="hero-actions">
+                      <button type="button" onClick={() => setActiveView('batches')} className="button-light">Manage batches <span aria-hidden="true">→</span></button>
+                      <button type="button" onClick={() => setActiveView('certificates')} className="button-ghost-light">View certificates</button>
+                      <button type="button" onClick={() => setActiveView('consumer')} className="button-ghost-light">Public consumer verification</button>
+                      <button type="button" onClick={() => setActiveView('explorer')} className="button-ghost-light">Blockchain explorer</button>
+                    </div>
+                  </div>
+                  <div className="journey-card" aria-label="Product supply chain journey">
+                    <div className="journey-header"><span>SUPPLY CHAIN</span><span className="journey-live">● Blockchain</span></div>
+                    <div className="journey-step"><span className="journey-icon">◉</span><div><strong>Farm</strong><small>Product registered</small></div><span>01</span></div>
+                    <div className="journey-line" />
+                    <div className="journey-step"><span className="journey-icon">⇄</span><div><strong>Distributor</strong><small>Ownership transferred</small></div><span>02</span></div>
+                    <div className="journey-line" />
+                    <div className="journey-step"><span className="journey-icon">▣</span><div><strong>Retailer</strong><small>Ready for customers</small></div><span>03</span></div>
+                  </div>
+                </section>
+
+                <div className="overview-intro"><div><h2>Quick actions</h2><p>Choose what you want to do next.</p></div></div>
+                <div className="action-grid">
+                  <button type="button" className="action-tile" onClick={() => setActiveView('batches')}><span className="tile-icon">▤</span><strong>Food batches</strong><small>Register products and look up records</small><span className="tile-arrow">↗</span></button>
+                  <button type="button" className="action-tile" onClick={() => setActiveView('transfers')}><span className="tile-icon">⇄</span><strong>Transfer batches</strong><small>Move products to the next holder</small><span className="tile-arrow">↗</span></button>
+                  <button type="button" className="action-tile" onClick={() => setActiveView('certificates')}><span className="tile-icon">◇</span><strong>Certificates</strong><small>Upload, verify and revoke documents</small><span className="tile-arrow">↗</span></button>
+                  <button type="button" className="action-tile" onClick={() => setActiveView('admin')}><span className="tile-icon">⚙</span><strong>Permissions</strong><small>Assign roles to supply chain wallets</small><span className="tile-arrow">↗</span></button>
+                  <button type="button" className="action-tile" onClick={() => setActiveView('consumer')}><span className="tile-icon">▦</span><strong>Consumer verification</strong><small>Scan a QR code or check a batch without MetaMask</small><span className="tile-arrow">↗</span></button>
+                  <button type="button" className="action-tile" onClick={() => setActiveView('explorer')}><span className="tile-icon">▣</span><strong>Blockchain explorer</strong><small>Inspect blocks, transactions and gas usage</small><span className="tile-arrow">↗</span></button>
+                </div>
+
+                <section className="overview-lower">
+                  <div className="overview-intro"><div><h2>Wallet access</h2><p>Permissions for the currently connected wallet.</p></div></div>
+                  <div className="role-grid">
+                    {[
+                      ['Administrator', roles.admin],
+                      ['Farmer', roles.farmer],
+                      ['Distributor', roles.distributor],
+                      ['Retailer', roles.retailer],
+                      ['Certifier', roles.certifier]
+                    ].map(([name, granted]) => (
+                      <div className="role-card" key={name}>
+                        <span className={`role-indicator ${granted ? 'granted' : ''}`}>{granted ? '✓' : '—'}</span>
+                        <div><strong>{name}</strong><small>{contract ? (granted ? 'Access granted' : 'Not assigned') : 'Connect wallet to check'}</small></div>
+                      </div>
+                    ))}
+                  </div>
+                  {!contract && <div className="notice neutral"><span className="notice-symbol">ⓘ</span><div><strong>Not connected yet</strong><p>Use Connect MetaMask in the header to check your roles and work with the smart contract.</p></div></div>}
+                </section>
+              </>
+            )}
+
+            {activeView === 'processing' && <ProcessingStage />}
+
+            {activeView === 'batches' && (
+              <div className="feature-layout">
+                <div className="feature-column">
+                  {contract && roles.farmer ? (
+                    <section className="form-card">
+                      <div className="card-topline"><span className="step-tag">01 · REGISTER</span><span className="mini-tag">Farmer</span></div>
+                      <h2>Register a food batch</h2>
+                      
+                      <div className="metric-strip"><span>Next available batch ID</span><strong>#{nextBatchId}</strong></div>
+                      <form onSubmit={registerBatch}>
+                        {registrationInputs.map((input, index) => {
+                          const isDate = /date/i.test(input.name)
+                          const isNumber = input.type.startsWith('uint') || input.type.startsWith('int')
+                          return (
+                            <label key={index} className="field">
+                              <span>{makeLabel(input.name, index)}</span>
+                              <input type={isDate ? 'date' : isNumber ? 'number' : 'text'}
+                                value={values[index] || ''}
+                                onChange={event => setValues(previous => ({ ...previous, [index]: event.target.value }))}
+                                required />
+                            </label>
+                          )
+                        })}
+                        <label className="field"><span>Batch quantity (kg)</span><input type="number" min="0.001" step="any" max="1000000000000" required value={newBatchQuantityKg} onChange={e => setNewBatchQuantityKg(e.target.value)} placeholder="e.g. 1000" /><small>Recorded once for this batch; shipment records reuse this quantity.</small></label>
+                        <label className="field"><span>Farm location</span><input maxLength={200} required value={newFarmLocation} onChange={e => setNewFarmLocation(e.target.value)} placeholder="e.g. Fayoum, Egypt" /></label>
+                        <label className="field"><span>Farm description (optional)</span><textarea maxLength={500} value={newFarmDescription} onChange={e => setNewFarmDescription(e.target.value)} placeholder="Farm and growing methods" /></label>
+                        <label className="field"><span>Product image (optional)</span><input type="file" accept="image/jpeg,image/png,image/webp" onChange={e => setNewFarmImage(e.target.files?.[0] || null)} /></label>
+                        <label className="field"><span>Organic certificate PDF (optional)</span><input type="file" accept=".pdf,application/pdf" onChange={e => setNewCertificatePdf(e.target.files?.[0] || null)} /><small>The Farmer submits the document; the Certifier reviews and assigns certification details.</small></label>
+                        <button className="button-primary" type="submit" disabled={loading}>{loading ? 'Processing...' : 'Register batch'} <span aria-hidden="true">→</span></button>
+                      </form>
+                    </section>
+                  ) : (
+                    <div className="notice neutral"><span className="notice-symbol">ⓘ</span><div><strong>Farmer access required</strong><p>{!contract ? 'Connect MetaMask to register a batch.' : 'The connected wallet does not have the Farmer role.'}</p></div></div>
+                  )}
+                  {contract && roles.farmer && farmRetryBatchId && <BatchMetadataEditor key={`farm-retry-${farmRetryBatchId}`} account={account} initialBatchId={farmRetryBatchId} mode="farm" />}
+                  {contract && roles.farmer && certificateRetryBatchId && <CertificateUploadRetry batchId={certificateRetryBatchId} onSuccess={() => { setCertificateRetryBatchId(''); setMessage(`Certificate for Batch #${certificateRetryBatchId} submitted for review.`) }} />}
+                  {batch && <BatchQRCode batchId={batch.id} />}
+                </div>
+                <div className="feature-column">
+                  <section className="form-card">
+                    <div className="card-topline"><span className="step-tag">02 · LOOK UP</span><span className="mini-tag">Blockchain</span></div>
+                    <h2>Find a food batch</h2>
+                    <p className="card-description">Enter an existing batch ID to see its recorded details.</p>
+                    <form onSubmit={viewBatch}>
+                      <label className="field"><span>Batch ID</span><input type="number" min="1" step="1" placeholder="e.g. 1" value={searchId} onChange={event => setSearchId(event.target.value)} required /></label>
+                      <button className="button-primary" type="submit" disabled={loading || !contract}>View batch <span aria-hidden="true">→</span></button>
+                    </form>
+                  </section>
+                  {batch && <section className="result-card compact-batch-result">
+                    <div className="result-head"><div><span className="step-tag">BATCH SUMMARY</span><h2>{batch.productName}</h2></div><span className="status-chip">#{batch.id}</span></div>
+                    <div className="detail-list"><div><span>Farm</span><strong>{batch.farmName}</strong></div><div><span>Harvested</span><strong>{batch.harvestDate}</strong></div><div><span>Current stage</span><strong>{batch.stage}</strong></div><div><span>Current holder</span><strong>{batch.currentHolder ? walletDisplay(batch.currentHolder) : 'Unavailable'}</strong></div></div>
+                    <BatchMetadataSummary key={`batch-summary-${batch.id}`} batchId={batch.id} allowQuantityBackfill={!!account && account.toLowerCase() === batch.farmer.toLowerCase()} />
+                  </section>}
+                </div>
+              </div>
+            )}
+
+
+            {activeView === 'transfers' && (
+              <div className="feature-layout">
+                <section className="form-card">
+                  <div className="card-topline"><span className="step-tag">SHIPMENT + TRANSFER</span><span className="mini-tag">One combined form</span></div>
+                  <h2>Record transportation & transfer batch</h2>
+                  <div className="transfer-path"><span>Farmer</span><b>→</b><span>Distributor</span><b>→</b><span>Retailer</span></div>
+                  <p className="card-description">The current holder records the shipment and transfers custody to the next authorised wallet. Batch quantity is taken automatically from its original registration.</p>
+                  <form onSubmit={transferBatch}>
+                    <label className="field"><span>Batch ID</span><input type="number" min="1" step="1" placeholder="e.g. 7" value={transferId} onChange={event => { setTransferId(event.target.value); setShipmentTransferStatus('') }} required /></label>
+                    <label className="field"><span>Shipment ID</span><input type="text" maxLength="80" placeholder="e.g. SHIP-007-A" value={transferShipment.shipmentId} onChange={event => setTransferShipment(old => ({ ...old, shipmentId: event.target.value }))} required /></label>
+                    <label className="field"><span>Source</span><input type="text" maxLength="200" placeholder="e.g. Cairo" value={transferShipment.source} onChange={event => setTransferShipment(old => ({ ...old, source: event.target.value }))} required /></label>
+                    <label className="field"><span>Destination</span><input type="text" maxLength="200" placeholder="e.g. Fayoum" value={transferShipment.destination} onChange={event => setTransferShipment(old => ({ ...old, destination: event.target.value }))} required /></label>
+                    <label className="field"><span>Transporter</span><input type="text" maxLength="150" placeholder="Name of transporter" value={transferShipment.transporter} onChange={event => setTransferShipment(old => ({ ...old, transporter: event.target.value }))} required /></label>
+                    <label className="field"><span>Dispatch (UTC)</span><input type="datetime-local" value={transferShipment.dispatchTime} onChange={event => setTransferShipment(old => ({ ...old, dispatchTime: event.target.value }))} required /></label>
+                    <label className="field"><span>Arrival (UTC, optional)</span><input type="datetime-local" value={transferShipment.arrivalTime} min={transferShipment.dispatchTime || undefined} onChange={event => setTransferShipment(old => ({ ...old, arrivalTime: event.target.value }))} /></label>
+                    <label className="field"><span>Recipient wallet address</span><input type="text" placeholder="0x..." value={recipientAddress} onChange={event => setRecipientAddress(event.target.value)} required /><small>Distributor wallet after Farmer, or Retailer wallet after Distributor.</small></label>
+                    {shipmentTransferStatus && <p className="success-message" role="status">{shipmentTransferStatus}</p>}
+                    <button className="button-primary" type="submit" disabled={loading || !contract}>{loading ? 'Processing…' : 'Submit & transfer'} <span aria-hidden="true">→</span></button>
+                    <p className="card-description">MetaMask asks you to sign the off-chain shipment, then separately approve the Sepolia ownership transfer. If the second step fails, the saved shipment can be reused when you retry.</p>
+                  </form>
+                </section>
+                <section className="info-panel">
+                  <span className="tile-icon">⇄</span>
+                  <h2>How shipment & transfer work</h2>
+                  <div className="how-step"><span>1</span><p>Current holder fills in shipment, batch ID and next recipient in this one form.</p></div>
+                  <div className="how-step"><span>2</span><p>MetaMask signs the shipment; MongoDB saves its off-chain details.</p></div>
+                  <div className="how-step"><span>3</span><p>MetaMask confirms the transfer; Sepolia records the new holder and stage.</p></div>
+                  <button className="button-outline" type="button" onClick={() => setActiveView('batches')}>Look up a batch <span aria-hidden="true">→</span></button>
+                </section>
+              </div>
+            )}
+
+            {activeView === 'certificates' && (
+              <div className={`feature-layout certificate-workspace ${!roles.certifier ? 'certificate-workspace-public' : ''}`}>
+                <div className="feature-column">
+                  {contract && roles.certifier && <CertifierReview key={account} contract={contract} enabled />}
+                  {contract && (roles.certifier || roles.admin) && (
+                    <section className="form-card danger-card">
+                      <span className="step-tag">CERTIFICATE MANAGEMENT</span><h2>Revoke a certificate</h2>
+                      <form onSubmit={revokeCertificate}><label className="field"><span>Batch ID</span><input type="number" min="1" step="1" value={revokeBatchId} onChange={event => setRevokeBatchId(event.target.value)} required /></label>
+                        <button type="submit" className="button-danger" disabled={loading}>{loading ? 'Processing...' : 'Revoke certificate'}</button></form>
+                    </section>
+                  )}
+                </div>
+                <div className="feature-column">
+                  <section className="form-card">
+                    <span className="step-tag">CERTIFICATE LOOKUP</span><h2>View certificate status</h2>
+                    <form onSubmit={viewCertificate}><label className="field"><span>Batch ID</span><input type="number" min="1" step="1" value={certificateSearchId} onChange={event => setCertificateSearchId(event.target.value)} required /></label>
+                      <button className="button-primary" type="submit" disabled={loading || !contract}>View certificate</button></form>
+                  </section>
+                  {certificateDetails && <section className="result-card">
+                    <div className="result-head"><h2>Batch #{certificateDetails.batchId}</h2><span className={`status-chip ${certificateDetails.valid ? '' : 'invalid'}`}>{certificateDetails.valid ? 'Valid' : 'Invalid'}</span></div>
+                    <div className="detail-list"><div><span>Certificate number</span><strong>{certificateDetails.number}</strong></div><div><span>Issue date</span><strong>{certificateDetails.issueDate}</strong></div><div><span>Expiry date</span><strong>{certificateDetails.expiryDate}</strong></div></div>
+                    <a className="external-link" href={`https://teal-fantastic-fowl-808.mypinata.cloud/ipfs/${encodeURIComponent(certificateDetails.cid)}`} target="_blank" rel="noopener noreferrer">View PDF</a>
+                    <button type="button" className="button-outline" onClick={verifyPdfIntegrity} disabled={verifying}>{verifying ? 'Verifying…' : 'Verify PDF integrity'}</button>
+                    {verification && <p role="status" className={verification.status === 'match' ? 'success-message' : 'error-message'}>{verification.status === 'match' ? 'Document matches its blockchain hash.' : verification.status === 'mismatch' ? 'Document does not match its blockchain hash.' : verification.message}</p>}
+                  </section>}
+                </div>
+              </div>
+            )}
+
+            {activeView === 'consumer' && (
+              <PublicConsumer initialBatchId={initialConsumerId} abi={abi} contractAddress={CONTRACT_ADDRESS} />
+            )}
+
+            {activeView === 'explorer' && (
+              <BlockchainExplorer abi={abi} contractAddress={CONTRACT_ADDRESS} initialBatchId={explorerBatchId} />
+            )}
+
+            {activeView === 'admin' && (
+              <div className="feature-layout">
+                {contract && (roles.admin || processingAdmin) ? (
+                  <section className="form-card">
+                    <div className="card-topline"><span className="step-tag">ADMIN · PERMISSIONS</span><span className="mini-tag">Restricted</span></div>
+                    <h2>Assign a participant role</h2>
+                    <p className="card-description">Assign roles using the appropriate contract. Processor uses the Processing contract; the other roles use OrganicTrace.</p>
+                    <form onSubmit={grantRole}>
+                      <label className="field"><span>Select role</span><select value={roleType} onChange={event => setRoleType(event.target.value)}><option value="FARMER_ROLE">Farmer</option><option value="DISTRIBUTOR_ROLE">Distributor</option><option value="RETAILER_ROLE">Retailer</option><option value="CERTIFIER_ROLE">Certifier</option><option value="PROCESSOR_ROLE">Processor</option></select></label>
+                      <label className="field"><span>Wallet address</span><input type="text" placeholder="0x..." value={roleAddress} onChange={event => { setRoleAddress(event.target.value); setRoleDisplayName(participantName(event.target.value)) }} required /><small>Paste the participant's Ethereum wallet address.</small></label>
+                      <label className="field"><span>Participant name (required)</span><input type="text" required maxLength={100} placeholder="e.g. Green Valley Distributor" value={roleDisplayName} onChange={event => setRoleDisplayName(event.target.value)}/><small>Required for this form. Saved to MongoDB after an Admin signature; the blockchain still stores the wallet address.</small></label>
+                      <button className="button-primary" type="submit" disabled={loading || (roleType === 'PROCESSOR_ROLE' ? !processingAdmin : !roles.admin)}>{loading ? 'Processing...' : 'Grant role'} <span aria-hidden="true">→</span></button>
+                    </form>
+                  </section>
+                ) : (
+                  <div className="notice neutral"><span className="notice-symbol">ⓘ</span><div><strong>Administrator access required</strong><p>{contract ? 'The connected wallet is not an administrator of either contract.' : 'Connect MetaMask with an administrator account.'}</p></div></div>
+                )}
+                {contract && roles.admin && <section className="form-card">
+                  <span className="step-tag">OPTIONAL DISPLAY LABELS</span>
+                  <h2>Name an existing participant</h2>
+                  <p className="card-description">Set or update Farmer, Distributor, Retailer, Certifier or Admin names using an Admin wallet signature, without sending a blockchain transaction. Names are stored in MongoDB and shared by devices that can reach this backend.</p>
+                  <form onSubmit={saveNameLabel}>
+                    <label className="field"><span>Wallet address</span><input type="text" placeholder="0x..." value={nameAddress} onChange={event => { setNameAddress(event.target.value); setNameValue(participantName(event.target.value)) }} required /></label>
+                    <label className="field"><span>Display name (required)</span><input type="text" maxLength={100} value={nameValue} onChange={event => setNameValue(event.target.value)} placeholder="Participant name" /></label>
+                    <button type="submit" className="button-outline" disabled={loading}>Save participant name to MongoDB</button>
+                  </form>
+                </section>}
+                <section className="info-panel"><span className="tile-icon">⚙</span><h2>Who does what?</h2><div className="roles-explainer"><p><strong>Farmer</strong><span>Registers new food batches.</span></p><p><strong>Distributor</strong><span>Receives and transfers batches.</span></p><p><strong>Retailer</strong><span>Receives the final shipment.</span></p><p><strong>Certifier</strong><span>Registers and revokes certificates.</span></p><p><strong>Processor</strong><span>Records processing for assigned batches.</span></p></div></section>
+              </div>
+            )}
+          </div>
+          <footer>OrganicTrace · Organic Food Traceability System · Bachelor Project</footer>
+        </main>
+      </div>
+
+      {(message || error) && (
+        <div className={`toast ${error ? 'toast-error' : 'toast-success'}`} role={error ? 'alert' : 'status'} aria-live={error ? 'assertive' : 'polite'}>
+          <span className="toast-icon" aria-hidden="true">{error ? '!' : loading ? '…' : '✓'}</span>
+          <div className="toast-copy"><strong>{error ? 'Something went wrong' : loading ? 'Processing request' : 'Update'}</strong><p>{error || message}</p></div>
+          <button type="button" className="toast-close" aria-label="Dismiss notification" onClick={() => {setMessage(''); setError('')}}>×</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default App
