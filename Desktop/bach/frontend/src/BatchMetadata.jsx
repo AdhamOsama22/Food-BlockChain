@@ -3,7 +3,7 @@ import { BrowserProvider } from 'ethers'
 import { CHAIN_ID } from './sepoliaConfig'
 import './BatchMetadata.css'
 
-const API = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:3001').replace(/\/$/, '')
+const API = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? '' : 'http://127.0.0.1:3001')).replace(/\/$/, '')
 const gateway = (import.meta.env.VITE_IPFS_GATEWAY || 'https://gateway.pinata.cloud/ipfs/').replace(/\/$/, '') + '/'
 export const metadataImageUrl = cid => cid && /^[a-zA-Z0-9]+$/.test(cid) ? `${gateway}${cid}` : ''
 

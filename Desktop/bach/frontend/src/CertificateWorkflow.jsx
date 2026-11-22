@@ -3,7 +3,7 @@ import { BrowserProvider } from 'ethers'
 import { saveSignedMetadata } from './BatchMetadata'
 import { CHAIN_ID } from './sepoliaConfig'
 
-const API = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:3001').replace(/\/$/, '')
+const API = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? '' : 'http://127.0.0.1:3001')).replace(/\/$/, '')
 
 /** Farmer provides only the actual PDF; certifier supplies certification details. */
 export async function submitFarmerCertificate(batchId, file) {

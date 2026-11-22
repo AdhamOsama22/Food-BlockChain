@@ -746,7 +746,7 @@ function App() {
       const formData = new FormData()
       formData.append('file', certificateFile)
 
-      const response = await fetch(`${(import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:3001').replace(/\/$/, '')}/upload`, {
+      const response = await fetch(`${(import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? '' : 'http://127.0.0.1:3001')).replace(/\/$/, '')}/upload`, {
         method: 'POST',
         body: formData
       })

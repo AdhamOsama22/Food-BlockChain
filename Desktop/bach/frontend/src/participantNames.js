@@ -2,7 +2,7 @@
 import { BrowserProvider } from 'ethers'
 import { CHAIN_ID } from './sepoliaConfig.js'
 
-const API = `${(import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:3001').replace(/\/$/, '')}/api`
+const API = `${(import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? '' : 'http://127.0.0.1:3001')).replace(/\/$/, '')}/api`
 export const PARTICIPANTS_UPDATED = 'organictrace:participants-updated'
 let cache = Object.create(null)
 
