@@ -1,0 +1,28 @@
+/* Product verification summary — scoped to the consumer card. */
+.ot-verification{padding:clamp(20px,3vw,32px)}
+.ot-verification .result-head{margin-bottom:18px}
+.ot-verification-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:15px 18px;background:#f4f8f4;border-radius:12px}
+.ot-verification-heading>div{display:flex;flex-direction:column;gap:3px}
+.ot-verification-heading strong{font-size:1.1rem;color:#233d30;text-transform:capitalize}
+.ot-verification-heading span{font-size:.87rem;color:#61736a}
+.ot-certificate-pill{display:inline-flex;align-items:center;white-space:nowrap;padding:8px 12px;border-radius:99px;background:#f3efec;color:#7f5149;font-size:.83rem!important;font-weight:700}
+.ot-certificate-pill.is-valid{background:#dcefe2;color:#226040}
+.ot-verification-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:22px 0 26px}
+.ot-verification-facts>div{display:flex;flex-direction:column;gap:5px;min-width:0}
+.ot-verification-facts span{color:#738279;font-size:.82rem}
+.ot-verification-facts strong{font-size:.98rem;color:#253a30;overflow-wrap:anywhere}
+.ot-verification-subtitle{font-size:1.12rem;margin:0 0 12px;color:#203a2c}
+.ot-verification-stages{list-style:none;padding:0;margin:0;border:1px solid #e4ebe5;border-radius:14px;overflow:hidden}
+.ot-verification-stage{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:15px 18px;min-height:57px;background:#fff}
+.ot-verification-stage+ .ot-verification-stage{border-top:1px solid #edf1ed}
+.ot-stage-name{font-size:.97rem;font-weight:600;color:#243a2e}
+.ot-stage-mark{display:inline-flex;align-items:center;justify-content:center;flex:none;width:30px;height:30px;border-radius:50%;border:1px solid #e3e8e4;background:#f5f6f5;color:#8b9890;font-weight:800;font-size:1.12rem;line-height:1}
+.ot-stage-mark.is-complete{background:#e0f0e3;border:1px solid #cce5d1;color:#266b43}
+.ot-verification-status{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:20px 2px 0;margin-top:18px;border-top:1px solid #e4ebe5}
+.ot-verification-status strong{color:#233b2e;font-size:.98rem}
+.ot-verification-status span{font-size:.96rem;font-weight:700;color:#77817a}
+.ot-verification-status span.is-verified{color:#246441}
+@media(max-width:520px){.ot-verification-facts{grid-template-columns:1fr}.ot-verification-stage{padding:13px 14px}.ot-verification-status{gap:8px}}
+
+/* Shipment records establish that transportation was reported, not delivered. */
+.ot-stage-mark.is-recorded{width:auto;min-width:74px;padding:0 10px;border-radius:99px;background:#fff4de;border:1px solid #f0d9a6;color:#80581b;font-size:.76rem;font-weight:700}

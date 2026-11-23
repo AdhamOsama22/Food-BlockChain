@@ -1,0 +1,4 @@
+.shipment-integrity { display: inline-flex; margin-top: .4rem; font-size: .86rem; font-weight: 600; }
+.shipment-integrity--verified { color: #16834b; }
+.shipment-integrity--modified { color: #ad342b; }
+.shipment-integrity--not-anchored, .shipment-integrity--unavailable, .shipment-integrity--checking { color: #777; }

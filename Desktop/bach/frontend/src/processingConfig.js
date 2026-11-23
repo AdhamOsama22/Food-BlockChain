@@ -1,7 +1,7 @@
 import { Contract, JsonRpcProvider, isAddress } from 'ethers'
 import { PUBLIC_RPC_URL, CHAIN_ID, CONTRACT_ADDRESS } from './sepoliaConfig.js'
 
-export const PROCESSING_ADDRESS = (import.meta.env.VITE_PROCESSING_CONTRACT_ADDRESS || '').trim()
+export const PROCESSING_ADDRESS = (import.meta.env.VITE_PROCESSING_CONTRACT_ADDRESS || '0xb68cacdb1da2811b29a52bbfd97c8021b37cc27a').trim()
 export const PROCESSING_ABI = [
   'function foodTraceability() view returns (address)',
   'function DEFAULT_ADMIN_ROLE() view returns (bytes32)',

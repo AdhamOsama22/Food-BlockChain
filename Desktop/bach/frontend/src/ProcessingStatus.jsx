@@ -17,16 +17,16 @@ export default function ProcessingStatus({ batchId, compact = false }) {
   }, [batchId])
   if (!processingConfigured) return null
   return <section className="result-card processing-on-chain-status">
-    <div className="result-head"><div><span className="step-tag">SEPOLIA · VERIFIED PROCESSING</span><h2>Processing facility</h2></div></div>
+    <div className="result-head"><div><span className="step-tag">PROCESSING</span><h2>Processing facility</h2></div></div>
     {error ? <p role="status">Processing record unavailable: {error}</p> : !record ? <p>Checking the Processing contract…</p> : !record.exists ? <p>No processing event has been recorded for this batch.</p> : <>
-      <p><strong>Processing completed</strong> — verified by a read from the on-chain Processing contract.</p>
+      <p><strong>Processing completed</strong> ✓</p>
       <div className="detail-list">
         <div><span>Quantity received</span><strong>{record.quantityKg} kg</strong></div>
         <div><span>Processing method</span><strong>{record.method}</strong></div>
         <div><span>Processing date</span><strong>{when(record.date)}</strong></div>
         <div><span>Confirmed in block</span><strong>#{record.block}</strong></div>
       </div>
-      {!compact && <a className="external-link" target="_blank" rel="noreferrer" href={`https://sepolia.etherscan.io/address/${PROCESSING_ADDRESS}`}>Inspect processing contract on Sepolia ↗</a>}
+      {!compact && <a className="external-link" target="_blank" rel="noreferrer" href={`https://sepolia.etherscan.io/address/${PROCESSING_ADDRESS}`}>View transaction details ↗</a>}
     </>}
   </section>
 }

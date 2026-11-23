@@ -34,13 +34,12 @@ export default function BatchQRCode({ batchId }) {
       <div>
         <span className="step-tag">CONSUMER VERIFICATION</span>
         <h3>Batch #{batchId} QR code</h3>
-        <p>Scan to open the product's public history and certificate status. No MetaMask required.</p>
+        <p>Scan to open the product's public history and certificate status.</p>
         <div className="qr-actions">
           <a className="qr-link" href={url} target="_blank" rel="noopener noreferrer">Open consumer page ↗</a>
           <button type="button" className="qr-small-button" onClick={copyLink}>Copy link</button>
           <button type="button" className="qr-small-button" onClick={saveQRCode}>Download PNG</button>
         </div>
-        <p className="qr-local-warning">To scan from another device, deploy the website and set VITE_PUBLIC_APP_URL to its public HTTPS address. Localhost links only work on your computer.</p>
       </div>
       <div className="qr-image"><QRCodeCanvas id={canvasId} value={url} size={156} marginSize={2} level="M" title={`OrganicTrace batch ${batchId}`} /></div>
     </section>

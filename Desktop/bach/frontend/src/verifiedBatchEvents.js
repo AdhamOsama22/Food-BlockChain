@@ -133,9 +133,18 @@ export async function getBatchEvents(iface, batchId, contract = CONTRACT_ADDRESS
 
   try {
     const logs = await readPages(`/addresses/${CONTRACT_ADDRESS}/logs`)
+
+    // Diagnostic only: helps identify why registration/certification may be missing.
+    console.log('[OrganicTrace] Total Blockscout logs:', logs.length)
+
     collect(found, logs, iface, id)
+
+    console.log('[OrganicTrace] Batch ID:', id)
+    console.log('[OrganicTrace] Matching batch events:', ordered(found))
+
     indexedLogsComplete = true
   } catch (error) {
+    console.warn('[OrganicTrace] Blockscout log lookup failed:', error.message)
     errors.push(`Explorer logs: ${error.message}`)
   }
 
@@ -196,6 +205,8 @@ export async function getBatchEvents(iface, batchId, contract = CONTRACT_ADDRESS
       }
     }
   }
+
+  console.log('[OrganicTrace] Matching events after receipt fallback:', ordered(found))
 
   if (found.size) return ordered(found)
   if (indexedLogsComplete && successfulReads === candidates.length) return []

@@ -11,6 +11,7 @@ import ProcessingStage from './ProcessingStage'
 import { PROCESSING_ADDRESS, PROCESSING_ABI, processingConfigured } from './processingConfig.js'
 import { participantName, saveParticipantName, walletDisplay, loadParticipantNames } from './participantNames'
 import { CONTRACT_ADDRESS, CHAIN_ID, NETWORK_NAME } from './sepoliaConfig'
+import { anchorShipment, hashShipment, shipmentIntegrityConfigured, verifyShipmentIntegrity } from './shipmentIntegrity.js'
 import './App.css'
 
 const STAGES = ['Farmer', 'Distributor', 'Retailer']
@@ -599,7 +600,8 @@ function App() {
     setShipmentTransferStatus('')
     setLoading(true)
 
-    let shipmentConfirmed = false
+    let shipmentSaved = false
+    let shipmentAnchored = false
     let transferConfirmed = false
     try {
       if (!contract || !account) throw new Error('Connect MetaMask first.')
@@ -607,9 +609,10 @@ function App() {
       if (!isAddress(recipientAddress.trim())) throw new Error('Enter a valid recipient address.')
 
       const id = BigInt(transferId.trim())
+      const batchId = id.toString()
       const existing = await loadBatch(id)
       if (existing.currentHolder.toLowerCase() !== account.toLowerCase()) {
-        throw new Error('Only the current on-chain holder can submit shipment information and transfer this batch.')
+        throw new Error('Only the current on-chain holder can record shipment information and transfer this batch.')
       }
       let requiredRole
       if (existing.stage === 'Farmer') {
@@ -628,8 +631,6 @@ function App() {
         throw new Error('Unexpected transferBatch ABI.')
       }
 
-      // A single screen, but two separate systems: MongoDB save then Sepolia transaction.
-      // Preflight BEFORE signing prevents failed transfers from creating unnecessary shipments.
       const payload = Object.fromEntries(Object.entries(transferShipment).map(([key, value]) => [key, value.trim()]))
       for (const key of ['shipmentId', 'source', 'destination', 'transporter', 'dispatchTime']) {
         if (!payload[key]) throw new Error(`Enter shipment ${key.replace(/([A-Z])/g, ' $1').toLowerCase()}.`)
@@ -638,54 +639,103 @@ function App() {
         throw new Error('Arrival time cannot be before dispatch time.')
       }
 
-      const metadata = await fetchBatchMetadata(id.toString())
+      const metadata = await fetchBatchMetadata(batchId)
       if (!(Number(metadata.details?.quantityKg) > 0)) {
-        throw new Error('The original batch quantity is missing. The Farmer must save it before this shipment can be recorded.')
+        throw new Error('Original batch quantity is missing. The Farmer must save it first.')
       }
-      // A previous click may have saved the shipment but failed to transfer due to
-      // MetaMask rejection or insufficient gas. Reuse only an EXACT matching record,
-      // signed by this wallet, so retrying cannot duplicate or hijack another shipment.
+
+      // If an earlier attempt saved successfully, don't create a duplicate.
+      // Reuse the record ONLY when its signed fields, signer and stage match.
       const saved = (metadata.details?.shipments || []).find(s => s.shipmentId === payload.shipmentId)
       if (saved) {
         const matches = ['shipmentId', 'source', 'destination', 'transporter', 'dispatchTime', 'arrivalTime']
           .every(key => (saved[key] || '') === (payload[key] || ''))
         if (!matches || saved.recordedBy?.toLowerCase() !== account.toLowerCase() || Number(saved.custodyStageAtRecording) !== STAGES.indexOf(existing.stage)) {
-          throw new Error('This Shipment ID already belongs to a different shipment. Enter a unique Shipment ID.')
+          throw new Error('This Shipment ID belongs to another shipment. Use a unique Shipment ID.')
         }
-        shipmentConfirmed = true
-        setShipmentTransferStatus('The matching shipment was already saved. Retrying only the blockchain transfer.')
+        shipmentSaved = true
+        setShipmentTransferStatus('Matching shipment already recorded. Checking its integrity before transfer.')
       } else {
-        setMessage('Step 1 of 2: Sign the transportation details with MetaMask...')
-        await saveSignedMetadata(id.toString(), 'shipment', payload, null)
-        shipmentConfirmed = true
-        setShipmentTransferStatus('Shipment saved to MongoDB. Ownership transfer is next.')
+        setMessage('Step 1 of 3: Sign and save shipment details...')
+        await saveSignedMetadata(batchId, 'shipment', payload, null)
+        shipmentSaved = true
+        setShipmentTransferStatus('Shipment details saved. Checking blockchain integrity...')
       }
 
+      // CRITICAL: Hash the actual saved record, NOT the pre-save form.
+      // The backend supplies quantity/unit, so hashing payload here would differ.
+      const reread = await fetchBatchMetadata(batchId)
+      const persisted = (reread.details?.shipments || []).find(s => s.shipmentId === payload.shipmentId)
+      if (!persisted) throw new Error('Shipment was saved but could not be retrieved. Do not transfer yet; retry.')
+      if (persisted.recordedBy?.toLowerCase() !== account.toLowerCase()) throw new Error('Unexpected shipment signer.')
+      if (Number(persisted.custodyStageAtRecording) !== STAGES.indexOf(existing.stage)) throw new Error('Shipment custody stage has changed.')
+      if (['shipmentId', 'source', 'destination', 'transporter', 'dispatchTime', 'arrivalTime']
+        .some(key => (persisted[key] || '') !== (payload[key] || ''))) throw new Error('Saved shipment differs from submitted details.')
+      if (Number(persisted.quantity) !== Number(metadata.details.quantityKg) || persisted.unit !== 'kg') {
+        throw new Error('Saved shipment quantity or unit is inconsistent with the registered batch.')
+      }
+      const digest = hashShipment(persisted, batchId)
+      if (persisted.shipmentHash && persisted.shipmentHash.toLowerCase() !== digest.toLowerCase()) {
+        throw new Error('Shipment hash differs from the backend hash. No blockchain transfer was made.')
+      }
+
+      // Only anchor when a real deployed ShipmentIntegrity address has been configured.
+      // With no configuration, retain the previous off-chain workflow; never imply verification.
+      if (shipmentIntegrityConfigured) {
+        setMessage('Step 2 of 3: Verify or anchor shipment on Sepolia...')
+        const current = await verifyShipmentIntegrity(batchId, persisted)
+        if (current.status === 'modified') {
+          throw new Error('An on-chain hash already exists but differs from this shipment. Transfer stopped.')
+        }
+        if (current.status === 'verified') {
+          shipmentAnchored = true
+          setShipmentTransferStatus('Existing shipment hash verified. Continuing with transfer.')
+        } else if (current.status === 'not-anchored') {
+          setShipmentTransferStatus('Confirm the shipment integrity transaction in MetaMask.')
+          await anchorShipment(batchId, persisted)
+          shipmentAnchored = true
+          const confirmed = await verifyShipmentIntegrity(batchId, persisted)
+          if (confirmed.status !== 'verified') {
+            throw new Error('Shipment transaction was submitted, but verification is not yet confirmed. Retry without changing the Shipment ID.')
+          }
+          setShipmentTransferStatus('Shipment integrity verified. Ownership transfer is next.')
+        } else {
+          throw new Error('Cannot verify shipment integrity: ' + (current.error || current.status) + '. Transfer stopped.')
+        }
+      } else {
+        setShipmentTransferStatus('Shipment recorded. Blockchain integrity anchoring is not configured.')
+      }
+
+      // A holder can anchor only BEFORE they transfer custody.
+      const args = new Array(2)
       const idPosition = transferFunction.inputs.findIndex(input => input.type.startsWith('uint'))
       const addressPosition = transferFunction.inputs.findIndex(input => input.type === 'address')
       if (idPosition < 0 || addressPosition < 0) throw new Error('Unexpected transferBatch parameters.')
-      const args = new Array(2)
       args[idPosition] = id
       args[addressPosition] = recipientAddress.trim()
-      setMessage('Step 2 of 2: Confirm the ownership transfer in MetaMask...')
+      setMessage(shipmentIntegrityConfigured ? 'Step 3 of 3: Confirm ownership transfer in MetaMask...' : 'Confirm ownership transfer in MetaMask...')
       const tx = await contract.transferBatch(...args)
       const receipt = await tx.wait()
-      if (receipt.status !== 1) throw new Error('The blockchain transfer transaction failed.')
+      if (receipt.status !== 1) throw new Error('Blockchain transfer failed.')
       transferConfirmed = true
       const updated = await loadBatch(id)
       setBatch(updated)
-      setSearchId(id.toString())
+      setSearchId(batchId)
       setTransferId('')
       setRecipientAddress('')
       setTransferShipment({ shipmentId: '', source: '', destination: '', transporter: '', dispatchTime: '', arrivalTime: '' })
       setShipmentTransferStatus('')
-      setMessage(`Shipment saved and Batch #${id} transferred successfully to ${updated.stage}!`)
+      setMessage(shipmentAnchored
+        ? `Shipment integrity verified and Batch #${batchId} transferred successfully to ${updated.stage}!`
+        : `Shipment recorded and Batch #${batchId} transferred successfully to ${updated.stage}. Shipment is not blockchain-integrity verified.`)
     } catch (err) {
-      if (shipmentConfirmed && !transferConfirmed) {
-        console.error('Transfer failed after shipment save:', err)
+      if (shipmentSaved && !transferConfirmed) {
+        console.error('Shipment saved but transfer incomplete:', err)
         setMessage('')
-        setShipmentTransferStatus('Shipment saved successfully. The batch was NOT transferred. Keep the same Shipment ID and try Submit & transfer again; your shipment will not be duplicated.')
-        setError(err.shortMessage || err.reason || err.message || 'Blockchain transfer failed.')
+        setShipmentTransferStatus(shipmentAnchored
+          ? 'Shipment integrity anchored, but ownership was NOT transferred. Keep the same Shipment ID and retry.'
+          : 'Shipment saved, but ownership was NOT transferred. Keep the same Shipment ID and retry.')
+        setError(err.shortMessage || err.reason || err.message || 'Shipment anchoring or transfer failed.')
       } else {
         showError(err)
       }
@@ -1220,7 +1270,7 @@ function App() {
                     <label className="field"><span>Recipient wallet address</span><input type="text" placeholder="0x..." value={recipientAddress} onChange={event => setRecipientAddress(event.target.value)} required /><small>Distributor wallet after Farmer, or Retailer wallet after Distributor.</small></label>
                     {shipmentTransferStatus && <p className="success-message" role="status">{shipmentTransferStatus}</p>}
                     <button className="button-primary" type="submit" disabled={loading || !contract}>{loading ? 'Processing…' : 'Submit & transfer'} <span aria-hidden="true">→</span></button>
-                    <p className="card-description">MetaMask asks you to sign the off-chain shipment, then separately approve the Sepolia ownership transfer. If the second step fails, the saved shipment can be reused when you retry.</p>
+                    <p className="card-description">Sign the shipment, {shipmentIntegrityConfigured ? 'confirm its integrity transaction, then ' : ''}approve the ownership transfer. If a step fails, retry with the same Shipment ID.{!shipmentIntegrityConfigured ? ' Shipment integrity anchoring is not configured yet.' : ''}</p>
                   </form>
                 </section>
                 <section className="info-panel">

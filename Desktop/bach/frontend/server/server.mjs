@@ -11,6 +11,7 @@ import dotenv from 'dotenv'
 import { MongoClient } from 'mongodb'
 import { randomBytes, createHash } from 'node:crypto'
 import { Contract, JsonRpcProvider, getAddress, isAddress, verifyMessage } from 'ethers'
+import { canonicalShipment, SHIPMENT_SCHEMA_VERSION } from '../src/shipmentCanonical.mjs'
 
 dotenv.config()
 
@@ -508,7 +509,13 @@ app.put('/api/batches/:batchId/metadata', requireMetadataOrigin, metadataImageUp
     } else {
       const existing = await database.collection('batchDetails').findOne(key, { projection: { shipments: 1 } })
       if (existing?.shipments?.some(x => x.shipmentId === challenge.payload.shipmentId)) return res.status(409).json({ error: 'Shipment ID already exists for this batch.' })
+      // Hash only the canonical, signed shipment details. The server-generated
+      // recordedAt/recordId fields are deliberately excluded from schema v1.
+      // Do NOT label this record on-chain verified until an independent
+      // ShipmentIntegrity contract anchor exists and matches this digest.
       const entry = { ...challenge.payload, recordedBy: challenge.signer, recordedAt: now.toISOString(), recordId: randomBytes(12).toString('hex'), custodyStageAtRecording: Number(batch.stage), recordType: 'off-chain' }
+      entry.shipmentHash = '0x' + sha256(Buffer.from(canonicalShipment(entry, req.params.batchId), 'utf8'))
+      entry.shipmentHashSchema = SHIPMENT_SCHEMA_VERSION
       await database.collection('batchDetails').updateOne(key, { $push: { shipments: entry }, $setOnInsert: { ...key, createdAt: now } }, { upsert: true })
     }
     res.json({ success: true })

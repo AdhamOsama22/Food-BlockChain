@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Contract, Interface, JsonRpcProvider, formatEther, id as keccakId } from 'ethers'
 import { walletDisplay, PARTICIPANTS_UPDATED, loadParticipantNames } from './participantNames'
+
+// Present participant names cleanly; retain wallet addresses in the technical explorer.
+const participantDisplay = address => walletDisplay(address).replace(/\s*\(MongoDB label\)/gi, '')
 import { PUBLIC_RPC_URL, CHAIN_ID, getEventStartBlock } from './sepoliaConfig'
 import { getBatchEvents } from './verifiedBatchEvents'
-import ProcessingStatus from './ProcessingStatus'
+import { loadProcessing, processingConfigured, PROCESSING_ADDRESS } from './processingConfig.js'
 import './BlockchainExplorerDashboard.css'
 
 const RECENT_BLOCKS = 10
 const MAX_RECENT_TRANSACTIONS = 40
 const BATCH_PAGE_SIZE = 15
+const BLOCK_TRANSACTIONS_PAGE_SIZE = 10
 
 function shorten(value, left = 12, right = 8) {
   if (!value) return '—'
@@ -81,7 +85,7 @@ function parseFields(inputs, args, prefix = '') {
     let formatted = readable(value)
     if (/date|timestamp/i.test(name) && /^(u?int)/.test(input.type)) {
       const seconds = Number(value)
-      if (Number.isFinite(seconds) && seconds > 0 && seconds < 8640000000000) formatted = `${localTime(seconds)} (Unix: ${value})`
+      if (Number.isFinite(seconds) && seconds > 0 && seconds < 8640000000000) formatted = localTime(seconds)
     }
     return [{ label: `${prefix}${prettyName(name)}`, value: formatted }]
   })
@@ -151,7 +155,7 @@ async function loadBatchSnapshot(provider, contractAddress, abi, batchId) {
 
 function FieldRows({ fields }) {
   return <div className="detail-list">{fields.map((field, index) => (
-    <div key={`${field.label}-${index}`}><span>{field.label}</span><strong className="break-anywhere">{typeof field.value === 'string' && /^0x[a-fA-F0-9]{40}$/.test(field.value) ? walletDisplay(field.value) : field.value}</strong></div>
+    <div key={`${field.label}-${index}`}><span>{field.label}</span><strong className="break-anywhere">{typeof field.value === 'string' && /^0x[a-fA-F0-9]{40}$/.test(field.value) ? participantDisplay(field.value) : field.value}</strong></div>
   ))}</div>
 }
 
@@ -201,6 +205,9 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
   const [batchListLimit, setBatchListLimit] = useState(BATCH_PAGE_SIZE)
   const historyRef = useRef(null)
   const [batchHistory, setBatchHistory] = useState(null)
+  const [processingRecord, setProcessingRecord] = useState(null)
+  const [processingLoading, setProcessingLoading] = useState(false)
+  const [processingError, setProcessingError] = useState('')
   const [batchError, setBatchError] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
   const [, refreshLabels] = useState(0)
@@ -208,6 +215,7 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
   const [lookupBusy, setLookupBusy] = useState(false)
   const [lookupError, setLookupError] = useState('')
   const [activePanel, setActivePanel] = useState(null)
+  const [blockTransactionLimit, setBlockTransactionLimit] = useState(BLOCK_TRANSACTIONS_PAGE_SIZE)
 
   // nextBatchId supplies the total number of registered batches. Only fetch the
   // current page to avoid issuing thousands of RPC requests for large datasets.
@@ -329,6 +337,20 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
   }
 
   useEffect(() => {
+    let active = true
+    setProcessingRecord(null)
+    setProcessingError('')
+    setProcessingLoading(false)
+    if (!batchHistory?.id || !processingConfigured) return () => { active = false }
+    setProcessingLoading(true)
+    loadProcessing(batchHistory.id)
+      .then(data => { if (active) setProcessingRecord(data) })
+      .catch(err => { if (active) setProcessingError(err.message) })
+      .finally(() => { if (active) setProcessingLoading(false) })
+    return () => { active = false }
+  }, [batchHistory?.id])
+
+  useEffect(() => {
     if (batchHistory && historyRef.current) {
       historyRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
     }
@@ -346,6 +368,7 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
     setLookupBusy(true)
     setLookupError('')
     setDetail(null)
+    setBlockTransactionLimit(BLOCK_TRANSACTIONS_PAGE_SIZE)
     try {
       if (/^\d+$/.test(value)) {
         const number = Number(value)
@@ -374,6 +397,11 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
     event.preventDefault()
     inspect(lookup)
   }
+
+  const combinedTimeline = batchHistory ? [
+    ...batchHistory.transactions.map(tx => ({ kind: 'transaction', blockNumber: Number(tx.blockNumber), logIndex: Number(tx.logIndex || 0), tx })),
+    ...(processingRecord?.exists ? [{ kind: 'processing', blockNumber: Number(processingRecord.block), logIndex: 0, record: processingRecord }] : [])
+  ].sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex) : []
 
   return (
     <div className="explorer-page">
@@ -417,28 +445,42 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
             <div><span>Gas used</span><strong>{detail.block.gasUsed.toString()}</strong></div>
             <div><span>Gas limit</span><strong>{detail.block.gasLimit.toString()}</strong></div>
           </div>
-          {detail.block.transactions.length > 0 && <div className="explorer-block-transactions"><h3>Transactions in this block</h3>{detail.block.transactions.map(hash => <button type="button" className="explorer-hash-link break-anywhere" key={hash} onClick={() => inspect(hash)}>{hash} →</button>)}</div>}
+          {detail.block.transactions.length > 0 && <div className="explorer-block-transactions">
+            <h3>Transactions in this block</h3>
+            <p className="card-description">Showing {Math.min(blockTransactionLimit, detail.block.transactions.length)} of {detail.block.transactions.length} transactions</p>
+            {detail.block.transactions.slice(0, blockTransactionLimit).map(hash =>
+              <button type="button" className="explorer-hash-link break-anywhere" key={hash} onClick={() => inspect(hash)}>{hash} →</button>
+            )}
+            {blockTransactionLimit < detail.block.transactions.length &&
+              <button type="button" className="button-outline explorer-load-more" onClick={() => setBlockTransactionLimit(v => v + BLOCK_TRANSACTIONS_PAGE_SIZE)}>
+                Show 10 more transactions
+              </button>}
+          </div>}
         </> : <>
           <h2>{detail.action}</h2>
           {detail.summary && <p className="explorer-meaningful-summary">{detail.summary}</p>}
-          <p className="explorer-context-note">Participant display names come from MongoDB and are not blockchain-verified identities.</p>
-          {detail.inputFields.length > 0 && <div className="explorer-context-section"><h3>Recorded transaction information</h3><p className="explorer-context-note">Decoded from this transaction's original smart-contract call.</p><FieldRows fields={detail.inputFields} /></div>}
-          {detail.eventFields.map((event, index) => <div className="explorer-context-section" key={`${event.name}-${index}`}><h3>Blockchain event: {event.name}</h3><p className="explorer-context-note">Actual event emitted when this transaction executed.</p><FieldRows fields={event.fields} /></div>)}
+          
+          {detail.inputFields.length > 0 && <div className="explorer-context-section"><h3>Recorded transaction information</h3><FieldRows fields={detail.inputFields} /></div>}
+          {detail.eventFields.map((event, index) => <div className="explorer-context-section" key={`${event.name}-${index}`}><h3>Blockchain event: {event.name}</h3><FieldRows fields={event.fields} /></div>)}
           {detail.batchId && <button type="button" className="button-outline" onClick={() => loadHistory(detail.batchId)}>Show Batch #{detail.batchId} journey ↓</button>}
-          {detail.snapshot && <div className="explorer-context-section"><h3>Food batch — current on-chain state</h3><p className="explorer-context-note">Live state now; holder and stage may differ from what they were when this historical transaction occurred.</p><FieldRows fields={detail.snapshot} /></div>}
-          <div className="explorer-context-section"><h3>Technical transaction details</h3>
+          {detail.snapshot && <details className="explorer-context-section">
+            <summary style={{ cursor: 'pointer', fontWeight: 700, padding: '8px 0' }}>View current batch state</summary>
+            <FieldRows fields={detail.snapshot} />
+          </details>}
+          <details className="explorer-context-section">
+            <summary style={{ cursor: 'pointer', fontWeight: 700, padding: '8px 0' }}>Technical transaction details</summary>
           <div className="detail-list">
             <div><span>Transaction hash</span><strong className="break-anywhere">{detail.tx.hash}</strong></div>
             <div><span>Status</span><strong>{detail.receipt?.status === 1 ? 'Success' : detail.receipt?.status === 0 ? 'Failed' : 'Pending'}</strong></div>
             <div><span>Block number</span><strong>{detail.tx.blockNumber ?? 'Pending'}</strong></div>
             <div><span>Timestamp</span><strong>{localTime(detail.block?.timestamp)}</strong></div>
-            <div><span>From wallet</span><strong className="break-anywhere">{walletDisplay(detail.tx.from)}</strong></div>
-            <div><span>To address</span><strong className="break-anywhere">{detail.tx.to ? walletDisplay(detail.tx.to) : `Contract creation${detail.receipt?.contractAddress ? `: ${detail.receipt.contractAddress}` : ''}`}</strong></div>
+            <div><span>From wallet</span><strong className="break-anywhere">{participantDisplay(detail.tx.from)}</strong></div>
+            <div><span>To address</span><strong className="break-anywhere">{detail.tx.to ? participantDisplay(detail.tx.to) : `Contract creation${detail.receipt?.contractAddress ? `: ${detail.receipt.contractAddress}` : ''}`}</strong></div>
             <div><span>Value (ETH)</span><strong>{formatEther(detail.tx.value)}</strong></div>
             <div><span>Gas used</span><strong>{detail.receipt ? detail.receipt.gasUsed.toString() : 'Pending'}</strong></div>
             <div><span>Transaction fee (ETH)</span><strong>{detail.receipt ? formatEther(detail.receipt.gasUsed * detail.receipt.gasPrice) : 'Pending'}</strong></div>
             <div><span>Nonce</span><strong>{detail.tx.nonce}</strong></div>
-          </div></div>
+          </div></details>
         </>}
       </section>}
 
@@ -485,7 +527,7 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
           {transactions.length ? transactions.map(tx => <TransactionCard key={tx.hash} transaction={tx} onInspect={inspect} />) : <p className="explorer-empty">{busy ? 'Loading transactions…' : 'No transactions in the displayed blocks.'}</p>}
         </div>}
         {activePanel === 'batches' && <>
-          <p className="explorer-context-note">Select a food batch to view its complete on-chain journey.</p>
+          
           {batchListError && <p role="alert" className="error-message explorer-inline-error">{batchListError}</p>}
           <div className="ot-explorer-panel-list">
             {registeredBatches.map(batch => (
@@ -517,28 +559,28 @@ export default function BlockchainExplorer({ abi, contractAddress, initialBatchI
         {batchError && <p className="error-message" role="alert">{batchError}</p>}
         {batchHistory && <>
 
-          <ProcessingStatus batchId={batchHistory.id} />
+          {!processingConfigured && <p className="consumer-warning">Processing contract is not configured in this build (VITE_PROCESSING_CONTRACT_ADDRESS).</p>}
+          {processingError && <p className="consumer-warning" role="status">Processing record unavailable: {processingError}</p>}
+          {processingLoading && <p className="card-description">Checking the Processing contract…</p>}
           <h3 className="explorer-journey-heading">Recorded stages and actions</h3>
-          {batchHistory.transactions.length ? <ol className="timeline batch-chain-timeline">
-            {batchHistory.transactions.map((tx, index) => <li className="timeline-event" key={tx.hash}>
+          {combinedTimeline.length ? <ol className="timeline batch-chain-timeline">
+            {combinedTimeline.map((entry, index) => entry.kind === 'processing' ? <li className="timeline-event" key={`processing-${batchHistory.id}`}><span className="timeline-dot" aria-hidden="true" /><div className="explorer-journey-event"><div className="explorer-journey-event-header"><strong>{index + 1}. Processing completed</strong><span className="mini-tag">Block #{entry.blockNumber}</span></div><div className="detail-list"><div><span>Quantity received</span><strong>{entry.record.quantityKg} kg</strong></div><div><span>Processing method</span><strong>{entry.record.method}</strong></div><div><span>Processing date</span><strong>{new Date(entry.record.date * 1000).toLocaleDateString('en-GB', { timeZone: 'UTC', day: 'numeric', month: 'long', year: 'numeric' })}</strong></div><div><span>Processor</span><strong>{participantDisplay(entry.record.processor)}</strong></div></div><a className="external-link" href={`https://sepolia.etherscan.io/address/${PROCESSING_ADDRESS}`} target="_blank" rel="noreferrer">View processing record ↗</a></div></li> : (() => { const tx = entry.tx; return <li className="timeline-event" key={tx.hash}>
               <span className="timeline-dot" aria-hidden="true" />
               <div className="explorer-journey-event">
                 <div className="explorer-journey-event-header"><strong>{index + 1}. {tx.action}</strong><span className="mini-tag">Block #{tx.blockNumber}</span></div>
                 <small>{localTime(tx.timestamp)} · {tx.status === 1 ? 'Successful' : tx.status === 0 ? 'Failed' : 'Pending'} · Gas {tx.gasUsed}</small>
                 {tx.inputFields.length > 0 && <FieldRows fields={tx.inputFields} />}
                 {tx.eventFields.map((event, eventIndex) => <div key={`${event.name}-${eventIndex}`} className="explorer-journey-event-fields">
-                  <strong className="explorer-event-name">{event.name} (on-chain event)</strong><FieldRows fields={event.fields} />
+                  <strong className="explorer-event-name">{event.name}</strong><FieldRows fields={event.fields} />
                 </div>)}
                 <button type="button" className="explorer-hash-link break-anywhere" onClick={() => { inspect(tx.hash); window.scrollTo({ top: 0, behavior: 'smooth' }) }}>
                   Inspect transaction {shorten(tx.hash, 17, 10)} →
                 </button>
               </div>
-            </li>)}
-          </ol> : <p className="explorer-empty">No matching batch or certificate events were found in this node's history. The current batch record is shown above.</p>}
-          <p className="explorer-context-note">Stages are derived from actual Sepolia transactions and events. Participant names, if shown, are unverified MongoDB labels; wallet addresses remain visible.</p>
+            </li> })())}
+          </ol> : <p className="explorer-empty">No verified history entries were found for this batch. The current batch record is shown above.</p>}
         </>}
       </section>}
-      <p className="explorer-footnote">The lists display the latest {RECENT_BLOCKS} blocks and up to {MAX_RECENT_TRANSACTIONS} transactions. Use search to inspect older blocks or a specific transaction. Sepolia history is not erased when you restart your computer. Public RPCs can impose rate limits; configure the deployment block for complete event histories.</p>
     </div>
   )
 }

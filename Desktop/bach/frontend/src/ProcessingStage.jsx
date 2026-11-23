@@ -95,7 +95,7 @@ export default function ProcessingStage() {
       <label>Batch ID<input type="number" min="1" value={batchId} onChange={e=>setBatchId(e.target.value)} /></label>
       <button className="button-primary" type="button" disabled={busy} onClick={load}>Load batch & permissions</button>
       {snapshot && <div className="processing-summary"><strong>{snapshot.product} — Batch #{batchId}</strong><span>{snapshot.stage === 0 ? 'Currently at Farmer stage' : 'Batch has already left Farmer stage'}</span></div>}
-      {record?.exists && <div className="processing-summary"><strong>Processing already confirmed on Sepolia</strong><span>Received: {record.quantityKg} kg · Method: {record.method}</span><span>Block #{record.block}</span></div>}
+      {record?.exists && <div className="processing-summary"><strong>Processing already confirmed</strong><span>Received: {record.quantityKg} kg · Method: {record.method}</span><span>Block #{record.block}</span></div>}
       {error && <p className="processing-error" role="alert">{error}</p>}
       {message && <p className="processing-ok" role="status">{message}</p>}
     </section>

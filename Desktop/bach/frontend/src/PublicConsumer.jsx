@@ -6,6 +6,10 @@ import { BatchMetadataView, fetchBatchMetadata } from './BatchMetadata'
 import { participantName, loadParticipantNames, PARTICIPANTS_UPDATED } from './participantNames'
 import { PUBLIC_RPC_URL, CHAIN_ID, CONTRACT_ADDRESS } from './sepoliaConfig.js'
 import { getBatchEvents } from './verifiedBatchEvents.js'
+import './OrganicTraceVerification.css'
+import ShipmentIntegrityTag from './ShipmentIntegrityTag.jsx'
+import { verifyShipmentIntegrity } from './shipmentIntegrity.js'
+import './ShipmentIntegrity.css'
 
 const STAGES = ['Farmer', 'Distributor', 'Retailer']
 const IPFS_GATEWAY = 'https://teal-fantastic-fowl-808.mypinata.cloud/ipfs/'
@@ -50,6 +54,7 @@ export default function PublicConsumer({ initialBatchId = '', abi, contractAddre
   const [processingError, setProcessingError] = useState('')
   const [shipments, setShipments] = useState([])
   const [shipmentError, setShipmentError] = useState('')
+  const [shipmentVerification, setShipmentVerification] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [, updateNames] = useState(0)
@@ -164,6 +169,37 @@ export default function PublicConsumer({ initialBatchId = '', abi, contractAddre
     return () => { active = false }
   }, [record?.id])
 
+  // Verify each shipment independently when this batch's MongoDB records arrive.
+  // Never reuse a previous batch's result, and never treat RPC errors as success.
+  useEffect(() => {
+    let active = true
+    setShipmentVerification(null)
+    if (!record?.id || !shipments.length) return () => { active = false }
+
+    Promise.all(shipments.map(async shipment => {
+      if (!shipment?.shipmentId) return 'not-anchored'
+      try {
+        const result = await verifyShipmentIntegrity(record.id, shipment)
+        return result.status
+      } catch {
+        return 'unavailable'
+      }
+    })).then(statuses => {
+      if (active) setShipmentVerification({ batchId: record.id, shipments, statuses })
+    })
+    return () => { active = false }
+  }, [record?.id, shipments])
+
+  const checkedShipments = shipmentVerification?.batchId === record?.id &&
+    shipmentVerification?.shipments === shipments ? shipmentVerification.statuses : null
+  const transportVerified = shipments.length > 0 &&
+    checkedShipments?.length === shipments.length &&
+    checkedShipments.every(status => status === 'verified')
+  const transportMismatch = checkedShipments?.some(status => status === 'modified')
+  const transportPending = shipments.length > 0 && checkedShipments === null
+  const transportUnavailable = Boolean(shipmentError) ||
+    checkedShipments?.some(status => status === 'unavailable' || status === 'unconfigured')
+
   // A stage-order summary, not a claim of timestamp ordering across data sources.
   // Ownership and processing are validated on-chain; transport is MongoDB-sourced.
   const journey = []
@@ -177,6 +213,7 @@ export default function PublicConsumer({ initialBatchId = '', abi, contractAddre
     const transfers = history?.transfers || []
     const addShipment = (item, i) => journey.push({
       key: `transport-${item.recordId || i}-${i}`,
+      shipment: item,
       label: 'Transportation recorded',
       description: `Shipment ${item.shipmentId} · ${item.source} → ${item.destination} · ${item.transporter || 'Transporter not provided'}${item.quantity ? ` · ${item.quantity} ${item.unit || 'kg'}` : ''}`,
       provenance: 'Off-chain · MongoDB shipment record'
@@ -209,12 +246,10 @@ export default function PublicConsumer({ initialBatchId = '', abi, contractAddre
         <span className="step-tag">PUBLIC PRODUCT VERIFICATION</span>
         <h2>Know where your food came from.</h2>
         <p>Read the product's blockchain record, its actual custody events and organic certificate status. No wallet or login required.</p>
-        <p className="consumer-disclaimer">Participant names are retrieved from MongoDB. They are administrative profile labels, not blockchain-verified real-world identities.</p>
         <form className="consumer-search" onSubmit={search}>
           <label className="field"><span>Food batch ID</span><input type="number" min="1" step="1" value={inputId} onChange={e => setInputId(e.target.value)} placeholder="Enter a batch ID, e.g. 2" required /></label>
           <button type="submit" className="button-primary" disabled={busy}>{busy ? 'Checking blockchain…' : 'Verify product →'}</button>
         </form>
-        <p className="consumer-rpc-note">Reading from Ethereum Sepolia (chain ID 11155111). No local Hardhat node or MetaMask required. Public RPC limits may apply.</p>
       </section>
 
       {error && <div className="notice consumer-error" role="alert"><span className="notice-symbol">!</span><div><strong>Unable to verify this batch</strong><p>{error}</p></div></div>}
@@ -236,7 +271,7 @@ export default function PublicConsumer({ initialBatchId = '', abi, contractAddre
             <section className="result-card">
               <div className="result-head"><div><span className="step-tag">ORGANIC CERTIFICATION</span><h2>Certificate status</h2></div><span className={`status-chip ${!certificate?.valid ? 'invalid' : ''}`}>{!certificate ? 'Not registered' : certificate.valid ? 'Valid' : 'Invalid'}</span></div>
               {!certificate ? (
-                <p className="card-description">No certificate has been registered for this batch. The product's origin can still be traced, but organic certification is not verified.</p>
+                <p className="card-description">No certificate available.</p>
               ) : (
                 <>
                   <div className="detail-list">
@@ -249,20 +284,51 @@ export default function PublicConsumer({ initialBatchId = '', abi, contractAddre
                   </div>
                   <a className="external-link" href={`${IPFS_GATEWAY}${encodeURIComponent(certificate.cid)}`} target="_blank" rel="noopener noreferrer">View certificate PDF on IPFS ↗</a>
                   {!certificate.valid && <p className="consumer-warning">This certificate is not currently valid. Do not treat this product as certified on the basis of this document.</p>}
-                  <p className="consumer-disclaimer">Status is checked on-chain. This page does not automatically re-hash the downloaded PDF.</p>
                 </>
               )}
             </section>
           </div>
 
+          <section className="result-card ot-verification" aria-label="Product verification summary">
+            <div className="result-head"><div><span className="step-tag">PRODUCT VERIFICATION</span><h2>Product verification</h2></div></div>
+            <div className="ot-verification-heading"><div><strong>{record.product}</strong><span>Batch #{record.id}</span></div><span className={`ot-certificate-pill ${certificate?.valid ? 'is-valid' : ''}`}>{certificate?.valid ? '✓ Certified' : certificate ? 'Certification invalid' : 'Not certified'}</span></div>
+            <div className="ot-verification-facts">
+              <div><span>Origin</span><strong>{record.farm}</strong></div>
+              <div><span>Harvest</span><strong>{record.date}</strong></div>
+            </div>
+            <h3 className="ot-verification-subtitle">Supply Chain</h3>
+            <ul className="ot-verification-stages" aria-label="Supply chain verification">
+              {[
+                { label: 'Farm', ok: Boolean(history?.registration?.length), pending: Boolean(historyError) },
+                { label: 'Processing', ok: Boolean(processing?.exists), pending: !processingConfigured || Boolean(processingError) || processing === null },
+                {
+                  label: 'Transportation',
+                  ok: transportVerified,
+                  recorded: !transportVerified && shipments.length > 0 && !transportMismatch && !transportPending && !transportUnavailable,
+                  pending: transportPending || transportUnavailable,
+                  mark: transportVerified ? '✓' : transportMismatch ? 'Mismatch' : transportPending ? 'Checking…' :
+                    transportUnavailable ? 'Unavailable' : shipments.length > 0 ? 'Recorded' : '○'
+                },
+                { label: 'Distribution', ok: Boolean(history?.transfers?.[0]), pending: Boolean(historyError) },
+                { label: 'Retail', ok: Boolean(history?.transfers?.[1]), pending: Boolean(historyError) }
+              ].map(stage => <li className="ot-verification-stage" key={stage.label}>
+                <span className="ot-stage-name">{stage.label}</span>
+                <span className={`ot-stage-mark ${stage.ok ? 'is-complete' : ''} ${stage.recorded || (stage.mark && stage.mark !== '✓' && stage.mark !== '○') ? 'is-recorded' : ''}`} aria-label={`${stage.label}: ${stage.ok ? 'Verified' : stage.mark === 'Mismatch' ? 'Integrity mismatch' : stage.mark === 'Checking…' ? 'Checking integrity' : stage.pending ? 'Unavailable' : stage.recorded ? 'Recorded, not fully verified' : 'Not confirmed'}`}>
+                  {stage.mark ?? (stage.ok ? '✓' : stage.recorded ? 'Recorded' : stage.pending ? '—' : '○')}
+                </span>
+              </li>)}
+            </ul>
+            <div className="ot-verification-status"><strong>Blockchain status</strong><span className={history?.registration?.length ? 'is-verified' : ''}>{history?.registration?.length ? '✓ Verified' : historyError ? 'Unavailable' : 'Not confirmed'}</span></div>
+          </section>
           <section className="result-card journey-history">
             <div className="result-head"><div><span className="step-tag">PRODUCT TRACEABILITY</span><h2>Product journey</h2></div></div>
             <p className="card-description">Actual on-chain registration, processing and ownership transfers, together with separately labeled MongoDB shipment records. The sequence groups records by supply-chain stage; it does not prove exact ordering between off-chain and on-chain records.</p>
             {historyError && <p className="consumer-warning" role="status">{historyError}</p>}
+            {!processingConfigured && <p className="consumer-warning" role="status">Processing contract address is not configured in this build.</p>}
             {processingError && <p className="consumer-warning" role="status">Processing information unavailable: {processingError}</p>}
             {shipmentError && <p className="consumer-warning" role="status">Transportation information unavailable: {shipmentError}</p>}
             {journey.length ? <ol className="timeline">
-              {journey.map(item => <li key={item.key} className="timeline-event"><span className="timeline-dot" /><div><strong>{item.label}</strong>{item.description && <p>{item.description}</p>}<small>{item.provenance}</small></div></li>)}
+              {journey.map(item => <li key={item.key} className="timeline-event"><span className="timeline-dot" /><div><strong>{item.label}</strong>{item.description && <p>{item.description}</p>}<small>{item.provenance}</small>{item.shipment && <ShipmentIntegrityTag batchId={record.id} shipment={item.shipment} />}</div></li>)}
             </ol> : <p className="card-description">No timeline events are available yet. This does not mean the batch is missing from Sepolia.</p>}
           </section>
           <BatchMetadataView batchId={record.id} showShipments={false} />
